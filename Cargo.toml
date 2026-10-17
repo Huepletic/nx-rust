@@ -1,0 +1,40 @@
+[package]
+name = "nx-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+memmap2 = "0.9"
+anyhow = "1"
+png = "0.18.1"
+tokio = { version = "1.53.3", features = ["full"] }
+axum = "0.8.9"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+# axum-server тянет rustls с default-features=false → фича tls12 выключена, и rustls
+# отвергает ClientHello TLS 1.2 алертом 70 (protocol version). Планшетный BoringSSL
+# шлёт 1.2 → соединение рвётся до HTTP (curl: TLSV1_ALERT_PROTOCOL_VERSION).
+# Объявляем ту же версию rustls с tls12 — unification фич включает 1.2 во всей сборке.
+rustls = { version = "0.23", features = ["tls12"] }
+aes = "0.9.3"
+ecb = "0.2.1"
+sha2 = "0.11.1"
+hex = "0.4.3"
+x509-parser = "0.18.1"
+rand = "0.10.3"
+rsa = "0.9.10"
+serde = { version = "1.0.229", features = ["derive"] }
+cipher = "0.5.2"
+rand_core = "0.10.1"
+generic-array = "1.4.5"
+hybrid-array = "0.4.15"
+enet = "0.3.0"
+aes-gcm = "0.10"
+libc = "0.2"
+xkbcommon = "0.8"
+serde_json = "1"
+# mDNS/DNS-SD (_nvstream._tcp): нужен SO_REUSEADDR/SO_REUSEPORT — порт 5353 уже
+# занят systemd-resolved, без REUSE bind не пройдёт (так же делал python-прототип).
+socket2 = "0.6"
