@@ -4,7 +4,7 @@
 //! percentage=0 → parity-шардов нет, FEC-поля всё равно выставляются.
 
 use super::*;
-use crate::probes;
+use crate::probes::{self, FrameRef};
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -45,7 +45,26 @@ pub fn start(st: &Arc<StreamState>, cfg: AnnounceConfig) -> Result<()> {
         (cw, ch)
     };
     let fps = if cfg.max_fps > 0 { cfg.max_fps } else { launch.fps.max(1) };
-    let bitrate_k = cfg.bitrate_kbps.max(1_000);
+    // Битрейт: клиент (Moonlight) просит 9000k, но железо тянет больше —
+    // измерено (2026-10-18, /tmp/e1_vaapi3.txt): VAAPI Carrizo держит ~99 fps
+    // на 1088x800 BGRA при 9000/20000/30000k CBR одинаково. NX_BITRATE_KBPS
+    // переопределяет клиентский запрос (по явной команде владельца — «битрейт
+    // выше»); дефолт — как просил клиент.
+    let bitrate_k = std::env::var("NX_BITRATE_KBPS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&b| b >= 1_000)
+        .unwrap_or(cfg.bitrate_kbps.max(1_000));
+
+    // Режим энкодера: NX_ENCODER=vaapi — собственный in-process VA-API энкодер
+    // (zero-copy dmabuf→VPP→H.264, без ffmpeg-процесса); дефолт ffmpeg.
+    let enc_mode = std::env::var("NX_ENCODER").as_deref().unwrap_or("ffmpeg").to_string();
+    if enc_mode == "vaapi" {
+        match start_vaapi(st.clone(), cfg.clone(), cw, ch, tw, th, fps, bitrate_k) {
+            Ok(()) => return Ok(()),
+            Err(e) => println!("vaapi: не удалось запустить ({e:#}) — фоллбек на ffmpeg"),
+        }
+    }
 
     // Конвейер целиком на GPU: hwupload поднимает BGRA-кадр в VAAPI-поверхность,
     // а scale_vaapi делает И масштаб, И конверсию BGRA->NV12. Раньше конверсия
@@ -102,6 +121,16 @@ pub fn start(st: &Arc<StreamState>, cfg: AnnounceConfig) -> Result<()> {
         .context("запуск ffmpeg (h264_vaapi)")?;
     let mut stdin = enc.stdin.take().context("ffmpeg stdin")?;
     let stdout = enc.stdout.take().context("ffmpeg stdout")?;
+    // Pipe stdin 4 МБ: дефолт 64 КБ разбивает write_all 3.48-МБ кадра на ~55
+    // пробуждений-копирований на кадр — при 60 fps это лишняя конкуренция CPU
+    // (замер: encoder-потолок 99 fps, тормозит CPU, не кодек).
+    {
+        use std::os::fd::AsRawFd;
+        let r = unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETPIPE_SZ, 4 << 20) };
+        if r < 0 {
+            println!("writer: F_SETPIPE_SZ не применился (не критично)");
+        }
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -129,7 +158,9 @@ pub fn start(st: &Arc<StreamState>, cfg: AnnounceConfig) -> Result<()> {
     let capture_done = Arc::new(AtomicBool::new(false));
     let done_c = capture_done.clone();
     std::thread::spawn(move || {
-        let r = probes::capture_loop(&output, fps, stop_c, move |data, _w, _h| {
+        let r = probes::capture_loop(&output, fps, stop_c, move |fr| {
+            // zero-copy позже: здесь по-прежнему BGRA-байты (ffmpeg-ветка).
+            let FrameRef::Bgra(data, _w, _h) = fr else { return Ok(()) };
             let mut buf = free_c.lock().unwrap().pop().unwrap_or_default();
             buf.clear();
             buf.extend_from_slice(data);
@@ -211,6 +242,186 @@ pub fn start(st: &Arc<StreamState>, cfg: AnnounceConfig) -> Result<()> {
         "stream: pipeline старт: захват {}x{}@{} → поток {}x{} @{}k packetsize={}",
         cw, ch, fps, tw, th, bitrate_k, cfg.packet_size
     );
+    Ok(())
+}
+
+/// Zero-copy ветка: собственный VA-API энкодер (dmabuf → VPP → H.264 → RTP)
+/// без ffmpeg-процесса. Требует dmabuf-путь захвата (NX_ENCODER=vaapi включает
+/// его принудительно): CPU вообще не читает пиксели — причина, по которой
+/// дефолтный путь shm (медленное UC-чтение dumb-mmap), здесь неприменима.
+///
+/// Heartbeat для watchdog: файл /tmp/nx-vaapi-alive обновляется раз в секунду
+/// (watchdog считает стрим живым по ffmpeg-процессу — в этой ветке его нет),
+/// лог ведётся в формате "writer: ... (всего N)" — last_writer_total работает
+/// без правок.
+#[allow(clippy::too_many_arguments)]
+fn start_vaapi(
+    st: Arc<StreamState>,
+    cfg: AnnounceConfig,
+    cw: u32,
+    ch: u32,
+    tw: u32,
+    th: u32,
+    fps: u32,
+    bitrate_k: u64,
+) -> Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // os-пайп: энкодер пишет Annex-B AU → rtp_sender_loop читает как Read
+    // (backpressure и парсер без изменений — тот же контракт, что у ffmpeg stdout).
+    let mut fds = [0i32; 2];
+    anyhow::ensure!(unsafe { libc::pipe(fds.as_mut_ptr()) } == 0, "pipe()");
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let pipe_rd = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) });
+    let pipe_wr = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) });
+    let mut pipe_wr = std::io::BufWriter::with_capacity(1 << 20, pipe_wr);
+
+    st.touch();
+    let output = st.output.clone();
+
+    // capture + inline-encode в одном потоке: screencopy-копия слота 1 уже в
+    // полёте у комозитора, пока CPU кодирует слот 0 — перекрытие сохраняется.
+    let stop_c = stop.clone();
+    let cap_done = Arc::new(AtomicBool::new(false));
+    let done_c = cap_done.clone();
+    let bitrate_bps = (bitrate_k * 1000) as u32;
+    let (tw2, th2) = (tw, th);
+
+    // Захват и кодирование — В РАЗНЫХ потоках (урок 2026-10-19: inline-encode
+    // в capture-потоке давал vaSyncBuffer-блокировку 7-13 мс прямо на пути
+    // захвата → клиент видел лаг). Слот глубины 1: энкодер отстаёт — старый
+    // кадр вытесняется новым, латентность не копится.
+    // FrameRef-слот: (slot-индекс, w, h, stride); dmabuf-буферы слотов живут
+    // в capture-потоке весь стрим — энкодер импортирует их по fd один раз.
+    type SlotFrame = (usize, u32, u32, u32);
+    let ready: Arc<Mutex<Option<SlotFrame>>> = Arc::new(Mutex::new(None));
+    let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // capture → ready-слот (только прокидка параметров, без пикселей)
+    let ready_c = ready.clone();
+    let dropped_c = dropped.clone();
+    let stop_cap = stop.clone();
+    std::thread::spawn(move || {
+        let r = probes::capture_loop(&output, fps, stop_cap, move |fr| {
+            let FrameRef::Dma { slot, w, h, stride, .. } = fr else {
+                anyhow::bail!("vaapi: пришёл Bgra-кадр (dmabuf-путь не активировался)");
+            };
+            let stale = ready_c.lock().unwrap().replace((slot, w, h, stride));
+            if stale.is_some() {
+                dropped_c.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        if let Err(e) = r {
+            println!("capture/vaapi: {e:#}");
+        }
+        done_c.store(true, Ordering::Relaxed);
+        println!("vaapi: capture поток завершён");
+    });
+
+    // ready-слот → энкодер → пайп
+    let ready_e = ready.clone();
+    let stop_e = stop.clone();
+    let drop_e = cap_done.clone();
+    let mut frames: u64 = 0;
+    let mut hb = Instant::now();
+    std::thread::spawn(move || {
+        // Энкодер лениво: dim'ы известны с первого кадра. Result — чтобы ошибка
+        // инициализации убила поток с логом, а не крутилась в цикле.
+        let mut enc: Result<crate::vaapi::VaEncoder, anyhow::Error> = Err(anyhow::anyhow!("не инициализирован"));
+        let mut inited = false;
+        loop {
+            if stop_e.load(Ordering::Relaxed) && drop_e.load(Ordering::Relaxed)
+                && ready_e.lock().unwrap().is_none()
+            {
+                break;
+            }
+            let Some((slot, w, h, stride)) = ready_e.lock().unwrap().take() else {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            // dumb-буферы слотов живут в capture-потоке; dmabuf fd стабилен.
+            // Для импорта нужен fd: возьмём через глобальную карту слотов
+            // (см. probes::slot_dmabuf_fd).
+            if !inited {
+                match crate::vaapi::VaEncoder::new(w, h, tw2, th2, bitrate_bps, GOP, fps) {
+                    Ok(e) => {
+                        println!("vaapi: энкодер {}x{}→{}x{}@{} {}k CBR GOP={} инициализирован", w, h, tw2, th2, fps, bitrate_bps / 1000, GOP);
+                        enc = Ok(e);
+                        inited = true;
+                    }
+                    Err(er) => {
+                        println!("vaapi: {er:#}");
+                        break;
+                    }
+                }
+            }
+            let res: Result<()> = (|| {
+                let e = enc.as_mut().unwrap();
+                if !e.slot_ready(slot) {
+                    let fd = probes::slot_dmabuf_fd(slot)
+                        .with_context(|| format!("fd слота {slot}"))?;
+                    e.import_slot(slot, fd, stride)?;
+                }
+                let au = e.encode_slot(slot)?;
+                pipe_wr.write_all(&au)?;
+                pipe_wr.flush()?;
+                Ok(())
+            })();
+            if let Err(er) = res {
+                println!("vaapi: encode стоп: {er:#}");
+                break;
+            }
+            frames += 1;
+            if hb.elapsed().as_millis() >= 1000 {
+                let _ = std::fs::write("/tmp/nx-vaapi-alive", format!("{}\n", frames));
+                let (vpp, setup, submit, sync) = match enc.as_ref() {
+                    Ok(e) => e.timing,
+                    Err(_) => (0.0, 0.0, 0.0, 0.0),
+                };
+                println!(
+                    "writer: {:.1} fps в vaapi-энкодер (всего {}), вытеснено {} | мс/кадр: vpp {:.2} setup {:.2} submit {:.2} sync(GPU-кодир) {:.2}",
+                    frames as f64 / hb.elapsed().as_secs_f64(),
+                    frames,
+                    dropped.load(Ordering::Relaxed),
+                    vpp, setup, submit, sync
+                );
+                hb = Instant::now();
+            }
+        }
+        drop(pipe_wr); // EOF в пайп → rtp-поток завершится
+        println!("vaapi: encode поток завершён");
+        // heartbeat погасить, чтобы watchdog не считал стрим живым
+        let _ = std::fs::remove_file("/tmp/nx-vaapi-alive");
+    });
+
+    // пайп → AU → RTP (тот же код, что у ffmpeg stdout)
+    let st_s = st.clone();
+    let stop_s = stop.clone();
+    let launch_copy = st.launch.lock().unwrap().clone(); // Option<Arc<LaunchSession>> — Arc клонируется
+    let launch_s = launch_copy.unwrap_or_else(|| Arc::new(LaunchSession {
+        appid: 0,
+        width: tw,
+        height: th,
+        fps,
+        rikey: String::new(),
+        rikeyid: String::new(),
+        av_ping_payload: String::new(),
+        control_connect_data: 0,
+    }));
+
+    std::thread::spawn(move || {
+        if let Err(e) = rtp_sender_loop(&st_s, pipe_rd, &launch_s, &cfg, fps, stop_s) {
+            println!("rtp: {e}");
+        }
+        println!("rtp: поток завершён (vaapi)");
+    });
+
+    *st.pipeline.lock().unwrap() = Some(PipelineHandle {
+        stop,
+        child: Mutex::new(None),
+    });
+    println!("stream: pipeline старт (VA-API in-process): захват {}x{}@{} → поток {}x{} @{}k", cw, ch, fps, tw, th, bitrate_k);
     Ok(())
 }
 
@@ -304,6 +515,11 @@ fn rtp_sender_loop(
     let mut frame_index: u32 = 0;
     let mut lowseq: u32 = 0;
     let mut frames_sent = 0u64;
+    // E12: байты за интервал — чтобы отличить «энкодер мало выдал» от
+    // «потеряно в пути» (наблюдение 05:01: на проводе 4 Мбит при изолированной
+    // норме энкодера 20.5 Мбит на том же testsrc2).
+    let mut bytes_window = 0u64;
+    let mut win_t = Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -321,14 +537,20 @@ fn rtp_sender_loop(
                 continue;
             };
             let ts90 = (epoch.elapsed().as_micros() as u64 * 90 / 1_000_000) as u32;
-            send_frame(&sock, peer, cfg, &au, ftype, frame_index, ts90, &mut lowseq)?;
+            let wire = send_frame(&sock, peer, cfg, &au, ftype, frame_index, ts90, &mut lowseq)?;
+            bytes_window += wire as u64;
             frame_index = frame_index.wrapping_add(1);
             frames_sent += 1;
             if frames_sent % 300 == 0 {
+                let dt = win_t.elapsed().as_secs_f64().max(1e-6);
                 println!(
-                    "rtp: {} кадров ({} B, type={}) → {}",
-                    frames_sent, au.len(), ftype, peer
+                    "rtp: {} кадров (посл {au_len} B, type={ftype}) → {peer} | rtp-вых: {mbps:.1} Мбит/с (окно {dt:.1}с)",
+                    frames_sent,
+                    au_len = au.len(),
+                    mbps = bytes_window as f64 * 8.0 / dt / 1e6,
                 );
+                bytes_window = 0;
+                win_t = Instant::now();
             }
         }
     }
@@ -441,7 +663,7 @@ fn send_frame(
     frame_index: u32,
     ts90: u32,
     lowseq: &mut u32,
-) -> Result<()> {
+) -> Result<usize> {
     let packetsize = cfg.packet_size;
     let blocksize = packetsize + MAX_RTP_HEADER; // полный UDP-пакет = packetsize+16
     let pbs = blocksize - VSZ; // данных на пакет = packetsize-16 (клиентский assert)
@@ -480,6 +702,7 @@ fn send_frame(
     }
     let unaligned = framed.len() / nblocks;
     let aligned = ((unaligned + blocksize - 1) / blocksize) * blocksize;
+    let mut wire_bytes = 0usize;
     for b in 0..nblocks {
         let start = b * aligned;
         let end = if b == nblocks - 1 {
@@ -517,10 +740,11 @@ fn send_frame(
         for x in 0..pp {
             let o = x * blocksize;
             sock.send_to(&block[o..o + blocksize], peer)?;
+            wire_bytes += blocksize;
         }
         *lowseq += pp as u32;
     }
-    Ok(())
+    Ok(wire_bytes)
 }
 
 fn write_u32_le(b: &mut [u8], v: u32) {

@@ -93,7 +93,7 @@ const ABS_MAX: i32 = 32767;
 /// >20 px (см. AbsoluteTouchContext#tapConfirmed) — от этого свайп по веб-странице
 /// превращался в выделение текста. Ждём: свайп → ЛКМ не жмём, тап → клик,
 /// «подержал >= DRAG_HOLD_MS и повёл» → перетаскивание.
-const DRAG_HOLD_MS: u128 = 150;
+const DRAG_HOLD_MS: u128 = 100;
 /// Допуск дрожания пальца, при котором касание не считается свайпом.
 const DRAG_PX: f64 = 24.0;
 
@@ -437,17 +437,6 @@ impl InputInjector {
                 .pending_hold_ms
                 .map(|t0| t0.elapsed().as_millis())
                 .unwrap_or(0);
-            if held >= DRAG_HOLD_MS as u128 {
-                // Палец стоял на месте, но долго — это удержание, а не тап.
-                // Клиент Moonlight сам пришлёт ПКМ (правый клик), а синтезированный
-                // здесь ЛКМ-тап ЕЁ ГАСИТ: измерено инжектором /tmp/uinj.py mode=hold —
-                // «ЛКМ 30мс + ПКМ» контекстное меню не открывает, «ПКМ» один — открывает.
-                trace(&format!(
-                    "lb: UP -> удержание ({held}ms) — ЛКМ-тап НЕ синтезируем, ПКМ даст клиент"
-                ));
-                self.pending_hold_ms = None;
-                return;
-            }
             // Тап. PRESS и RELEASE обязаны уехать в РАЗНЫХ SYN-кадрах:
             // измерено инжектором (/tmp/uinj.py mode=split|same), одно и то же устройство
             // и точка — пару [1,0,SYN] libinput/Hyprland проигнорирует (клик не доходит
@@ -457,7 +446,9 @@ impl InputInjector {
             // держим нажатие TAP_HOLD_MS, как настоящая мышь, и отпускаем отдельным кадром
             std::thread::sleep(std::time::Duration::from_millis(TAP_HOLD_MS));
             write_events(dev, &[(EV_KEY, BTN_LEFT, 0)]);
-            trace("lb: UP -> тап: release в своём кадре");
+            trace(&format!(
+                "lb: UP -> тап: release в своём кадре (held {held}ms)"
+            ));
             self.pending_hold_ms = None;
         } else if self.left_held {
             self.left_held = false;
@@ -939,25 +930,51 @@ unsafe fn ui_ioctl_ptr<T>(fd: libc::c_int, req: libc::c_ulong, ptr: *const T) ->
 
 /// Точка входа из control.rs: ленивая инициализация + разбор пачки.
 pub fn handle(st: &StreamState, pay: &[u8]) {
-    {
+    // Инжектор создаём ОДИН раз здесь, в control-потоке (как и было годами):
+    // контекст/окружение здесь проверены, а «вывод не найден в hyprctl» в
+    // воркере ронял создание на каждом пакете (03:26: 151 abs-устройство,
+    // 148 ошибок за 90 с). В воркер уходит ГОТОВЫЙ инжектор — он только
+    // парсит пакеты, зато control-поток больше не блокируется на слипах
+    // 30–150 мс внутри parse.
+    let tx = {
         let mut guard = st.input.lock().unwrap();
         if guard.is_none() {
             if INIT_FAILED.load(Ordering::Relaxed) {
                 return;
             }
-            match InputInjector::new(&st.output) {
-                Ok(inj) => *guard = Some(inj),
+            let inj = match InputInjector::new(&st.output) {
+                Ok(i) => i,
                 Err(e) => {
                     INIT_FAILED.store(true, Ordering::Relaxed);
-                    println!("input: инъекция недоступна (один раз): {:#}", e);
+                    println!("input: инъекция недоступна (один раз): {e:#}");
+                    return;
+                }
+            };
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let spawned = std::thread::Builder::new()
+                .name("input-worker".into())
+                .spawn(move || {
+                    let mut inj = Some(inj);
+                    for pay in rx {
+                        if let Some(i) = inj.as_mut() {
+                            i.parse(&pay);
+                        }
+                    }
+                });
+            match spawned {
+                Ok(_) => *guard = Some(tx),
+                Err(e) => {
+                    INIT_FAILED.store(true, Ordering::Relaxed);
+                    println!("input: воркер не поднялся: {e}");
                     return;
                 }
             }
         }
-        if let Some(inj) = guard.as_mut() {
-            inj.parse(pay);
-        }
-    }
+        guard.as_ref().unwrap().clone()
+    };
+    // Потеря пакета при ошибке отправки лучше, чем копящийся лаг:
+    // движение курсора «догоняет» следующим пакетом, а не ретрансмиссией.
+    let _ = tx.send(pay.to_vec());
 }
 
 /// Самотест инъекции из CLI (`nx-server inputtest <output>`): создаёт uinput-устройства

@@ -41,6 +41,7 @@ USBDEVFS_RESET = 0x5514      # _IO('U', 20)
 
 CHECK_PERIOD = 5             # сек между проверками здоровья
 REPAIR_COOLDOWN = 90         # минимум между полными восстановлениями
+STREAM_STALL_SECS = 15       # живой ffmpeg, но кадры не идут столько → зависание
 MDNS_GROUP = "224.0.0.251"
 
 
@@ -110,9 +111,66 @@ def stream_active():
     """Живой (не defunct) ffmpeg = подключён клиент и идёт пайплайн.
     input_device_count() НЕ годится: uinput-устройства живут, пока работает
     nx-server, и не говорят о реальном стриме. ffmpeg спавнится при коннекте
-    и становится defunct/умирает при отключении."""
+    и становится defunct/умирает при отключении.
+    NX_ENCODER=vaapi: ffmpeg-процесса нет — живость по heartbeat-файлу
+    /tmp/nx-vaapi-alive (обновляется nx-server раз в секунду при encode)."""
     rc, out = sh("ps -eo stat,comm | grep ffmpeg | grep -v defunct")
-    return rc == 0 and "ffmpeg" in out
+    if rc == 0 and "ffmpeg" in out:
+        return True
+    try:
+        import os
+        st_ = os.stat("/tmp/nx-vaapi-alive")
+        age = time.time() - st_.st_mtime
+        return age < 5.0
+    except OSError:
+        return False
+
+
+def live_ffmpeg_pid():
+    """PID живого (Sl/S) ffmpeg, либо None. defunct (зомби) не считается живым.
+    NX_ENCODER=vaapi: процесса нет — возвращаем -1 (стрим жив по heartbeat,
+    stall-детектор ниже различает sentinel)."""
+    rc, out = sh("ps -eo pid,stat,comm | grep ffmpeg | grep -v defunct")
+    if rc == 0:
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[1][:1] in ("S", "R"):
+                try:
+                    return int(parts[0])
+                except ValueError:
+                    pass
+    try:
+        import os
+        st_ = os.stat("/tmp/nx-vaapi-alive")
+        if time.time() - st_.st_mtime < 5.0:
+            return -1
+    except OSError:
+        pass
+    return None
+
+
+def last_writer_total():
+    """Последний 'writer: ... (всего N)' из лога nx-server = реально ушедшие
+    в ffmpeg кадры. N двигается только при живом потоке."""
+    try:
+        with open("/tmp/nx-server.log", "rb") as f:
+            data = f.read()[-200000:]
+    except Exception:
+        return None
+    txt = data.decode("utf-8", "replace").replace("\x00", "")
+    last = None
+    for line in txt.splitlines():
+        if line.startswith("writer:") and "всего" in line:
+            m = re.search(r"всего\s+(\d+)", line)
+            if m:
+                last = int(m.group(1))
+    return last
+
+
+def server_alive():
+    """Процесс nx-server жив. pgrep -x (точное имя), чтобы не поймать обёртку."""
+    rc, out = sh("pgrep -x nx-server")
+    return rc == 0 and out.strip() != ""
 
 
 def mdns_membership_ok():
@@ -247,15 +305,18 @@ def ensure_mdns_membership():
 def restart_server():
     sh("pkill -x nx-server")
     time.sleep(3)
-    # nx-serverу нужен Wayland-контекст сессии et (иначе capture не подключится).
-    # Разрешаем подпись Hyprland динамически и запускаем от et, не от root.
-    env = ("XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 "
-           "HYPRLAND_INSTANCE_SIGNATURE=$(ls -t /run/user/1000/hypr/ "
-           "| grep _ | head -1)")
-    sh("cd %s && sudo -u et env NX_PIN_WAIT=1 %s %s serve --name %s --pin %s "
-       "> /tmp/nx-server.log 2>&1 < /dev/null &"
-       % (SERVER_DIR, env, SERVER_BIN, SERVER_NAME, SERVER_PIN), timeout=15)
+    # Запуск через launch_nx.sh: внутри setsid + env сессии et. Раньше запускали
+    # `sudo -u et env ... &` без setsid — процесс привязывался к шеллу watchdog'а
+    # и умирал вместе с ним (02:57:23: сервер поднялся и исчез за 48 c).
+    sh("chmod +x %s/launch_nx.sh; sudo -u et bash %s/launch_nx.sh &"
+       % (SERVER_DIR, SERVER_DIR), timeout=15)
     time.sleep(5)
+    # Приоритет: DDLC на этом 4-ядерном APU съедает ~75% CPU и дерёт fps
+    # (замер 04:04: writer 57fps против потолка энкодера 99fps). nx-server
+    # поднимаем на nice -10; ffmpeg-потоки унаследуют приоритет от родителя
+    # в момент спавна пайплайна.
+    sh("PID=$(pgrep -x nx-server | head -1); [ -n \"$PID\" ] && renice -n -10 -p $PID",
+       timeout=10)
     log("  перезапустил nx-server")
 
 
@@ -368,16 +429,64 @@ def repair(reason):
 
 
 def main():
-    log("nx-watchdog запущен (проверка каждые %ss, кулдаун %ss)"
-        % (CHECK_PERIOD, REPAIR_COOLDOWN))
+    log("nx-watchdog запущен (проверка каждые %ss, кулдаун %ss, стрим-стол %ss)"
+        % (CHECK_PERIOD, REPAIR_COOLDOWN, STREAM_STALL_SECS))
     last_repair = 0.0
+    last_stream_fix = 0.0
+    last_server_fix = 0.0
     fails = 0
+    # отслеживание продвижения кадров (writer: всего N) для ловли зависшего стрима
+    w_seen = None          # последнее виденное значение счётчика кадров
+    w_since = 0.0          # когда значение последний раз ИЗМЕНЯЛОСЬ (старт стола)
     while True:
         try:
             if ping_tablet():
                 if fails:
                     log("канал восстановился сам (%d fails)" % fails)
                 fails = 0
+                now = time.time()
+
+                # --- self-heal: nx-server умер при живой сети ---
+                # Раньше watchdog следил ТОЛЬКО за пингом: nx-server падал (например,
+                # после дисконнекта клиента) и его никто не поднимал — стрим лежал
+                # часами, пока пользователь не дёрнется. Теперь при живом пинге
+                # проверяем сам процесс сервера.
+                if not server_alive() and (now - last_server_fix) > REPAIR_COOLDOWN:
+                    last_server_fix = now
+                    log("NX-SERVER МЁРТВ при живом пинге — перезапуск")
+                    restart_server()
+                    time.sleep(3)
+                    now = time.time()
+
+                # --- мониторинг ЗДОРОВЬЯ СТРИМА (не сети) ---
+                # ping здоров, но capture мог умереть (EAGAIN и раньше т.п.) —
+                # картинка замёрзла, input от клиента ещё идёт. Раньше не ловилось:
+                # watchdog следил ТОЛЬКО за сетью. Сигнал: живой ffmpeg (Sl), но
+                # счётчик кадров не двигается. При чистом отключении клиента ffmpeg
+                # становится defunct (не Sl) → это не ложное срабатывание.
+                pid = live_ffmpeg_pid()
+                if pid is not None:
+                    w = last_writer_total()
+                    if w is None:
+                        w_since = now
+                    elif w != w_seen:
+                        w_seen = w          # кадры пошли/продвинулись — стол сброшен
+                        w_since = now
+                    elif w_since and (now - w_since) > STREAM_STALL_SECS \
+                            and (now - last_stream_fix) > REPAIR_COOLDOWN:
+                        last_stream_fix = now
+                        log("СТРИМ ЗАВИС: энкодер %s жив, кадры стоят >%ss — "
+                            "перезапуск сервера" % ("ffmpeg pid %s" % pid if pid > 0 else "vaapi (heartbeat)", STREAM_STALL_SECS))
+                        w_seen = None
+                        w_since = now
+                        restart_server()
+                        time.sleep(3)
+                        reconnect_stream()
+                else:
+                    # живого ffmpeg нет — стрима нет (простой/чистое отключение)
+                    w_seen = None
+                    w_since = 0.0
+
                 time.sleep(CHECK_PERIOD)
                 continue
 

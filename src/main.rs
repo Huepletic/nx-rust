@@ -11,6 +11,7 @@ mod mdns;
 mod nvhttp;
 mod probes;
 mod stream;
+mod vaapi;
 
 use anyhow::{bail, Context, Result};
 use std::sync::Arc;
@@ -43,6 +44,11 @@ fn main() -> Result<()> {
         "inputtest" => {
             if args.len() < 3 { usage(); }
             stream::input::selftest(&args[2])
+        }
+        "vaprobe" => {
+            // Z4a-пробник: dumb-dmabuf (BGRX, паттерн) → VaEncoder → /tmp/p3_rs.h264.
+            let frames: usize = if args.len() > 2 { args[2].parse().context("frames")? } else { 5 };
+            vaapi::selftest(frames)
         }
         "serve" => serve_cmd(&args[2..]),
         _ => { usage(); }

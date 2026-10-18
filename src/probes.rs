@@ -6,7 +6,7 @@
 use anyhow::{bail, Context, Result};
 use memmap2::MmapMut;
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use wayland_client::protocol::{
@@ -193,7 +193,18 @@ fn wait_for(
             }
             // Есть байты: читаем их в guarded-режиме и разбираем события.
             if let Some(guard) = queue.prepare_read() {
-                guard.read()?;
+                // EAGAIN/WouldBlock не фатален: неблокирующий wayland-сокет
+                // возвращает его на частичном сообщении / spurious-wake после
+                // poll. Раньше `?` гнал его наверх и убивал поток захвата
+                // («Io error: Resource temporarily unavailable (os error 11)»
+                // → «capture: поток завершён» → замороженная картинка). Байтов
+                // нет/неполно — крутим цикл дальше.
+                match guard.read() {
+                    Ok(_) => {}
+                    Err(WaylandError::Io(io))
+                        if io.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
             queue.dispatch_pending(state)?;
             if dbg {
@@ -538,10 +549,13 @@ pub fn capture_bench(want: &str, secs: u64) -> Result<()> {
     // считает — bench не меряет стоимость чтения mmap (shm cached vs dmabuf UC).
     let read_px = std::env::var("NX_SINK_READ").ok().as_deref() == Some("1");
     let mut pool: Vec<u8> = Vec::new();
-    let r = capture_loop(want, 60, stop, |data, w, h| {
+    let r = capture_loop(want, 60, stop, |fr| {
+        // FrameRef::Dma намеренно НЕ читаем: bench меряет только композитор+screencopy.
         if read_px {
-            pool.clear();
-            pool.extend_from_slice(&data[..(w * h * 4) as usize]);
+            if let FrameRef::Bgra(data, w, h) = fr {
+                pool.clear();
+                pool.extend_from_slice(&data[..(w * h * 4) as usize]);
+            }
         }
         Ok(())
     });
@@ -561,7 +575,7 @@ pub fn capture_loop<F>(
     mut sink: F,
 ) -> Result<()>
 where
-    F: FnMut(&[u8], u32, u32) -> Result<()>,
+    F: FnMut(FrameRef) -> Result<()>,
 {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -608,10 +622,12 @@ where
     //   NX_PATH=dmabuf|shm — путь захвата. Дефолт shm: на этом AMD APU mmap
     //     dmabuf (dumb, UC/WC) читается CPU ~158 мс/кадр (3.48 МБ) — реальный
     //     стрим падал до 5.9 fps. dmabuf — только по явному NX_PATH=dmabuf
-    //     (bench без чтения пикселей, NX_SINK_READ=0).
+    //     (bench без чтения пикселей, NX_SINK_READ=0). NX_ENCODER=vaapi тоже
+    //     форсирует dmabuf: энкодер импортирует fd, CPU не читает пиксели.
     //   NX_PIPE=0|1        — глубина пайплайна: 0 = старый последовательный (1 слот),
     //                        1 = два параллельных screencopy-запроса (2 слота)
-    let want_dma = std::env::var("NX_PATH").as_deref() == Ok("dmabuf") && dma_mgr.is_some();
+    let force_dma = std::env::var("NX_ENCODER").as_deref() == Ok("vaapi");
+    let want_dma = (force_dma || std::env::var("NX_PATH").as_deref() == Ok("dmabuf")) && dma_mgr.is_some();
     let pipe = std::env::var("NX_PIPE").as_deref() != Ok("0");
     let nslots: usize = if pipe { 2 } else { 1 };
     let mut use_dma = want_dma;
@@ -661,6 +677,8 @@ where
         }
         if probe_ok {
             println!("capture: путь=dmabuf slots={} (пробник ok)", nslots);
+        } else if force_dma {
+            bail!("NX_ENCODER=vaapi требует dmabuf-путь, но пробник не прошёл");
         } else {
             println!("capture: dmabuf-пробник не прошёл — путь=shm slots={}", nslots);
             use_dma = false;
@@ -777,7 +795,9 @@ where
             iter_ok = true;
             let t_c = Instant::now();
             frames[s].take().unwrap().destroy(); // иначе объекты screencopy-frame текутся (60/с) — Hyprland падает
-            sink_slot(&bufs[s], &mut sink, &mut nx_shot)?;
+            // Слот-индекс в референсе: vaapi-энкодер держит по VA-поверхности на
+            // слот (import_slot(slot)) — dmabuf-буферы слотов живут между кадрами.
+            sink_slot(&bufs[s], s, &mut sink, &mut nx_shot)?;
             let t_d = Instant::now();
             i += 1;
             a_copy += t_c.duration_since(t_copied[s]).as_micros();
@@ -908,6 +928,19 @@ fn fastrand() -> u64 {
 
 // === буферы по слотам (shm-pool или dumb dma-buf) ===
 
+/// Глобальный реестр живых dmabuf-слотов: fd + stride + dims. Обновляется
+/// capture-потоком при (пере)создании слота; encoder-поток pipeline-ветки
+/// vaapi читает fd для import_slot (fd жив, пока жив слот-буфер).
+pub static SLOT_DMABUF: [std::sync::Mutex<Option<(RawFd, u32, u32, u32)>>; 2] = [
+    std::sync::Mutex::new(None),
+    std::sync::Mutex::new(None),
+];
+
+/// fd dmabuf-слота (или None). Используется encoder-потоком vaapi.
+pub fn slot_dmabuf_fd(slot: usize) -> Option<RawFd> {
+    SLOT_DMABUF[slot.min(1)].lock().unwrap().as_ref().map(|t| t.0)
+}
+
 /// wl_buffer + пиксельные данные для слота. shm и dmabuf различаются только
 /// аллокацией; для sink оба отдают mmap (строка фиксированной длины).
 enum SlotBuf {
@@ -937,7 +970,11 @@ fn drop_slot_buf(b: &mut SlotBuf) {
             wl.destroy();
             pool.destroy();
         }
-        SlotBuf::Dma { wl, .. } => wl.destroy(),
+        SlotBuf::Dma { wl, .. } => {
+            // слот-индекс тут неизвестен — реестр чистится в ensure/create при пересоздании;
+            // encoder сам проверяет slot_ready/переподключение по ошибке encode.
+            wl.destroy()
+        }
         SlotBuf::None => {}
     }
 }
@@ -1065,6 +1102,10 @@ fn dma_create_slot(
         state.frames[slot].dma_failed = false;
         anyhow::bail!("created/failed: wl_buffer не создан");
     }
+    {
+        // реестр для encoder-потока (fd живёт, пока жив dumb)
+        *SLOT_DMABUF[slot].lock().unwrap() = Some((dumb.dmabuf_fd().as_raw_fd(), stride, d.width, d.height));
+    }
     Ok(SlotBuf::Dma {
         dumb,
         wl: wl.unwrap(),
@@ -1074,31 +1115,55 @@ fn dma_create_slot(
     })
 }
 
+/// Референс кадра для sink: пиксели (shm-путь, либо чтение dmabuf) или
+/// dmabuf-слот (zero-copy путь — энкодер импортирует fd, CPU не читает).
+pub enum FrameRef<'a> {
+    Bgra(&'a [u8], u32, u32),
+    Dma { slot: usize, dumb: &'a DumbBuffer, w: u32, h: u32, stride: u32 },
+}
+
 /// Отдаёт кадр слота в sink как BGRA (XRGB/ARGB LE байтово = BGRA, alpha
 /// ffmpeg-вским bgra игнорируется). stride == w*4 → отдаём mmap напрямую.
-fn sink_slot<F>(buf: &SlotBuf, sink: &mut F, nx_shot: &mut Option<String>) -> Result<()>
+fn sink_slot<F>(buf: &SlotBuf, slot: usize, sink: &mut F, nx_shot: &mut Option<String>) -> Result<()>
 where
-    F: FnMut(&[u8], u32, u32) -> Result<()>,
+    F: FnMut(FrameRef) -> Result<()>,
 {
-    let (data, w, h, stride) = match buf {
-        SlotBuf::Shm { mmap, w, h, stride, .. } => (&mmap[..], *w, *h, *stride),
-        SlotBuf::Dma { dumb, w, h, stride, .. } => (&dumb.map[..], *w, *h, *stride),
-        SlotBuf::None => bail!("sink: слот без буфера"),
-    };
     if let Some(p) = nx_shot.take() {
+        let (data, w, h, stride) = match buf {
+            SlotBuf::Shm { mmap, w, h, stride, .. } => (&mmap[..], *w, *h, *stride),
+            SlotBuf::Dma { dumb, w, h, stride, .. } => (&dumb.map[..], *w, *h, *stride),
+            SlotBuf::None => bail!("sink: слот без буфера"),
+        };
         let raw = bgra_from_xrgb(data, w, h, stride);
         save_png(&raw_bgra_to_rgba(&raw, w, h), w, h, &p)?;
         println!("capture: NX_SHOT {p}");
     }
-    if stride == w * 4 {
-        // LE XRGB/ARGB = B G R X/A, ffmpeg-вский bgra игнорирует альфу → пишем как есть
-        sink(&data[..(w * h * 4) as usize], w, h)
-    } else {
-        let mut buf2 = Vec::with_capacity((w * h * 4) as usize);
-        for y in 0..h {
-            buf2.extend_from_slice(&data[(y * stride) as usize..(y * stride + w * 4) as usize]);
+    match buf {
+        SlotBuf::Shm { mmap, w, h, stride, .. } => {
+            if *stride == *w * 4 {
+                // LE XRGB/ARGB = B G R X/A, ffmpeg-вский bgra игнорирует альфу → пишем как есть
+                sink(FrameRef::Bgra(&mmap[..(*w * *h * 4) as usize], *w, *h))
+            } else {
+                let mut buf2 = Vec::with_capacity((*w * *h * 4) as usize);
+                for y in 0..*h {
+                    buf2.extend_from_slice(&mmap[(y * stride) as usize..(y * stride + w * 4) as usize]);
+                }
+                sink(FrameRef::Bgra(&buf2, *w, *h))
+            }
         }
-        sink(&buf2, w, h)
+        SlotBuf::Dma { dumb, w, h, stride, .. } => {
+            if *stride == *w * 4 {
+                sink(FrameRef::Dma { slot, dumb, w: *w, h: *h, stride: *stride })
+            } else {
+                // длинный страйд → CPU-выравнивание в сплошной BGRA (редко)
+                let mut buf2 = Vec::with_capacity((*w * *h * 4) as usize);
+                for y in 0..*h {
+                    buf2.extend_from_slice(&dumb.map[(y * stride) as usize..(y * stride + w * 4) as usize]);
+                }
+                sink(FrameRef::Bgra(&buf2, *w, *h))
+            }
+        }
+        SlotBuf::None => bail!("sink: слот без буфера"),
     }
 }
 
