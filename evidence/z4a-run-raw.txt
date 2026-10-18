@@ -1,0 +1,16 @@
+vaapi: libva 1.24
+frame 0 IDR: bytes=594 encode=67.85 ms
+frame 1 P  : bytes=644 encode=12.62 ms
+frame 2 P  : bytes=610 encode=5.72 ms
+frame 3 P  : bytes=629 encode=6.44 ms
+frame 4 P  : bytes=591 encode=11.52 ms
+done: 5 frames, 3068 bytes, avg 20.83 ms/frame (48 fps)
+vaapi: libva 1.24
+frame 0 IDR: bytes=594 encode=61.74 ms
+frame 1 P  : bytes=644 encode=8.58 ms
+frame 2 P  : bytes=610 encode=14.23 ms
+frame 3 P  : bytes=629 encode=11.97 ms
+frame 4 P  : bytes=591 encode=6.33 ms
+frame 5 P  : bytes=601 encode=6.24 ms
+done: 90 frames, 51642 bytes, avg 42.49 ms/frame (24 fps)
+timing: p50=38.34 p95=108.05 p99=136.42 max=136.42 ms
