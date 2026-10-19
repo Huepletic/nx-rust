@@ -167,7 +167,10 @@ fn sdp() -> String {
      a=x-ss-general.featureFlags:0\r\n\
      a=x-ss-general.encryptionSupported:1\r\n\
      m=video 0 RTP/AVP 96\r\n\
-     a=rtpmap:96 H264/90000\r\n"
+     a=rtpmap:96 H264/90000\r\n\
+     m=audio 0 RTP/AVP 97\r\n\
+     a=rtpmap:97 opus/48000/2\r\n\
+     a=fmtp:97 surround-params=21101\r\n"
         .to_string()
 }
 
@@ -226,6 +229,10 @@ fn parse_announce(body: &[u8]) -> AnnounceConfig {
             }
             "x-nv-general.useReliableUdp" => cfg.use_reliable_udp = val.parse().unwrap_or(1),
             "x-ss-general.encryptionEnabled" => cfg.encryption_enabled = val.parse().unwrap_or(0),
+            "x-nv-audio.surround.numChannels" => {
+                cfg.audio_channels = val.parse().unwrap_or(2)
+            }
+            "x-nv-aqos.packetDuration" => cfg.packet_duration = val.parse().unwrap_or(5),
             "x-ml-video.configuredBitrateKbps" => {
                 let b: u64 = val.parse().unwrap_or(0);
                 if b > 0 {

@@ -45,13 +45,27 @@ pub fn spawn(hostname: &str, port: u16) -> Result<()> {
     let recv_sock = bind().context("mDNS bind 5353")?;
 
     // Вступаем в группу на всех интерфейсах: запрос может прийти с любого
-    // (RNDIS к планшету, Ethernet и т.п.).
-    let ips = local_ipv4s();
-    for ip in &ips {
+    // (RNDIS к планшету, Ethernet и т.п.). По ОДНОМУ адресу на интерфейс:
+    // на wlan0 может быть secondary-адрес (.181 при основном .180) — второй
+    // join по тому же интерфейсу падает с EADDRINUSE (наблюдалось 2026-10-19).
+    let mut joined: Vec<String> = Vec::new();
+    for (dev, addr, _mac) in crate::nvhttp::ifaddrs() {
+        let std::net::IpAddr::V4(ip) = addr else { continue };
+        if ip.is_loopback() || joined.contains(&dev) {
+            continue;
+        }
         recv_sock
-            .join_multicast_v4(&MDNS_GROUP, ip)
-            .with_context(|| format!("mDNS join {} on {}", MDNS_GROUP, ip))?;
+            .join_multicast_v4(&MDNS_GROUP, &ip)
+            .with_context(|| format!("mDNS join {} on {} ({})", MDNS_GROUP, ip, dev))?;
+        joined.push(dev);
     }
+    let ips: Vec<Ipv4Addr> = crate::nvhttp::ifaddrs()
+        .into_iter()
+        .filter_map(|(_dev, addr, _mac)| match addr {
+            std::net::IpAddr::V4(a4) if !a4.is_loopback() => Some(a4),
+            _ => None,
+        })
+        .collect();
     recv_sock.set_multicast_loop_v4(true).ok();
     recv_sock.set_multicast_ttl_v4(255).ok();
 

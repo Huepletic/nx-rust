@@ -3,6 +3,7 @@
 //! клиент ходит в RTSP :49010, видео идёт RTP/UDP :49000, control — ENet :49001,
 //! audio-drain — :49002. Спека: docs/gamestream-spec.md, эталон — Sunshine stream.cpp/rtsp.cpp.
 
+pub mod audio;
 pub mod control;
 pub mod input;
 pub mod pipeline;
@@ -44,6 +45,10 @@ pub struct AnnounceConfig {
     pub use_reliable_udp: u32,
     pub encryption_enabled: u32,
     pub bitrate_kbps: u64,
+    /// x-nv-audio.surround.numChannels (дефолт 2). 0 = клиент не хочет звук.
+    pub audio_channels: u32,
+    /// x-nv-aqos.packetDuration, мс (дефолт 5) — длительность opus-фрейма.
+    pub packet_duration: u32,
 }
 
 impl Default for AnnounceConfig {
@@ -57,6 +62,8 @@ impl Default for AnnounceConfig {
             use_reliable_udp: 1,
             encryption_enabled: 0,
             bitrate_kbps: 10_000,
+            audio_channels: 2,
+            packet_duration: 5,
         }
     }
 }
@@ -65,6 +72,8 @@ impl Default for AnnounceConfig {
 pub struct PipelineHandle {
     pub stop: Arc<AtomicBool>,
     pub child: Mutex<Option<std::process::Child>>,
+    /// ffmpeg-конвейер звука (pulse→opus→rtp): умирает вместе с конвейером.
+    pub audio_child: Mutex<Option<std::process::Child>>,
 }
 
 impl PipelineHandle {
@@ -72,6 +81,11 @@ impl PipelineHandle {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(mut c) = self.child.lock().unwrap().take() {
             let _ = c.kill();
+            let _ = c.wait(); // без wait дочерник остаётся зомби
+        }
+        if let Some(mut c) = self.audio_child.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
         }
     }
 }
@@ -80,6 +94,8 @@ pub struct StreamState {
     pub launch: Mutex<Option<Arc<LaunchSession>>>,
     pub announce: Mutex<Option<AnnounceConfig>>,
     pub video_peer: Mutex<Option<SocketAddr>>,
+    /// Аудио-пир: src его пингов на :49002 (тот же peer-learning, что у видео).
+    pub audio_peer: Mutex<Option<SocketAddr>>,
     pub video_sock: Arc<UdpSocket>,
     pub audio_sock: Arc<UdpSocket>,
     pub pipeline: Mutex<Option<PipelineHandle>>,
@@ -121,6 +137,7 @@ impl StreamState {
             launch: Mutex::new(None),
             announce: Mutex::new(None),
             video_peer: Mutex::new(None),
+            audio_peer: Mutex::new(None),
             video_sock: Arc::new(video_sock),
             audio_sock: Arc::new(audio_sock),
             pipeline: Mutex::new(None),

@@ -235,9 +235,14 @@ pub fn start(st: &Arc<StreamState>, cfg: AnnounceConfig) -> Result<()> {
     });
 
     *st.pipeline.lock().unwrap() = Some(PipelineHandle {
-        stop,
+        stop: stop.clone(),
         child: Mutex::new(Some(enc)),
+        audio_child: Mutex::new(None),
     });
+    // Аудио: pulse-монитор → opus → RTP клиенту (пир учтётся из его пингов).
+    if let Err(e) = audio::start(st.clone(), cfg.clone(), stop) {
+        println!("audio: не стартовал ({e:#}) — стрим без звука");
+    }
     println!(
         "stream: pipeline старт: захват {}x{}@{} → поток {}x{} @{}k packetsize={}",
         cw, ch, fps, tw, th, bitrate_k, cfg.packet_size
@@ -410,6 +415,7 @@ fn start_vaapi(
         control_connect_data: 0,
     }));
 
+    let cfg_a = cfg.clone();
     std::thread::spawn(move || {
         if let Err(e) = rtp_sender_loop(&st_s, pipe_rd, &launch_s, &cfg, fps, stop_s) {
             println!("rtp: {e}");
@@ -418,9 +424,14 @@ fn start_vaapi(
     });
 
     *st.pipeline.lock().unwrap() = Some(PipelineHandle {
-        stop,
+        stop: stop.clone(),
         child: Mutex::new(None),
+        audio_child: Mutex::new(None),
     });
+    // Аудио: pulse-монитор → opus → RTP клиенту (пир учтётся из его пингов).
+    if let Err(e) = audio::start(st.clone(), cfg_a, stop) {
+        println!("audio: не стартовал ({e:#}) — стрим без звука");
+    }
     println!("stream: pipeline старт (VA-API in-process): захват {}x{}@{} → поток {}x{} @{}k", cw, ch, fps, tw, th, bitrate_k);
     Ok(())
 }
@@ -479,6 +490,15 @@ pub fn start_audio_drain(st: Arc<StreamState>) {
             match sock.recv_from(&mut buf) {
                 Ok((n, src)) => {
                     st.touch(); // пинги клиента на аудио-порт — тоже пульс
+                    // Peer-learning: клиент шлёт SS_PING со своего аудио-сокета —
+                    // источник = адрес, куда слать аудио-RTP (как у видео).
+                    {
+                        let mut g = st.audio_peer.lock().unwrap();
+                        if *g != Some(src) {
+                            println!("audio: peer {} ({}B пинг)", src, n);
+                            *g = Some(src);
+                        }
+                    }
                     total += 1;
                     if total <= 3 || total % 1000 == 0 {
                         println!("audio: {} пакетов (последний {}B от {})", total, n, src);

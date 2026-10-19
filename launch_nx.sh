@@ -14,5 +14,6 @@ exec setsid env \
   NX_PIN_WAIT=1 \
   NX_BITRATE_KBPS=20000 \
   NX_ENCODER=vaapi \
+  NX_AUDIO_DELAY_MS=80 \
   ./target/release/nx-server serve --name archpizdetc --pin 1234 \
   >> /tmp/nx-server.log 2>&1 < /dev/null
