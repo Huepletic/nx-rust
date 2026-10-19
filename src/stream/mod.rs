@@ -44,6 +44,8 @@ pub struct AnnounceConfig {
     pub fec_min_required: u32,
     pub use_reliable_udp: u32,
     pub encryption_enabled: u32,
+    /// x-nv-general.featureFlags из ANNOUNCE (клиентские NVFF_*-биты).
+    pub feature_flags: u32,
     pub bitrate_kbps: u64,
     /// x-nv-audio.surround.numChannels (дефолт 2). 0 = клиент не хочет звук.
     pub audio_channels: u32,
@@ -61,10 +63,22 @@ impl Default for AnnounceConfig {
             fec_min_required: 0,
             use_reliable_udp: 1,
             encryption_enabled: 0,
+            feature_flags: 0,
             bitrate_kbps: 10_000,
             audio_channels: 2,
             packet_duration: 5,
         }
+    }
+}
+
+impl AnnounceConfig {
+    /// Клиент ожидает шифрование аудио-пейлоада (moonlight-common-c
+    /// SdpGenerator.c:195 AudioEncryptionEnabled = клиентский ENCFLG_AUDIO |
+    /// SS_ENC_AUDIO). Мы SS_ENC_AUDIO не advertise'им, но клиент шлёт свой бит
+    /// NVFF_AUDIO_ENCRYPTION(0x20) в x-nv-general.featureFlags — по нему и
+    /// Sunshine узнаёт о желании клиента (rtsp.cpp:1167).
+    pub fn audio_encrypted(&self) -> bool {
+        self.feature_flags & 0x20 != 0 || self.encryption_enabled & 4 != 0
     }
 }
 

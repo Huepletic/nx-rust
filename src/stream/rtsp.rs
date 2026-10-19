@@ -127,9 +127,10 @@ fn handle_conn(mut sock: TcpStream, addr: SocketAddr, st: &Arc<StreamState>) -> 
         "ANNOUNCE" => {
             let cfg = parse_announce(&req.body);
             println!(
-                "rtsp: ANNOUNCE packetSize={} fps={} viewport={}x{} bitrate={}k fec_min={} reliableUdp={} encryption={}",
+                "rtsp: ANNOUNCE packetSize={} fps={} viewport={}x{} bitrate={}k fec_min={} reliableUdp={} encryption={} featureFlags={} audio_enc={}",
                 cfg.packet_size, cfg.max_fps, cfg.client_w, cfg.client_h,
-                cfg.bitrate_kbps, cfg.fec_min_required, cfg.use_reliable_udp, cfg.encryption_enabled
+                cfg.bitrate_kbps, cfg.fec_min_required, cfg.use_reliable_udp, cfg.encryption_enabled,
+                cfg.feature_flags, cfg.audio_encrypted()
             );
             *st.announce.lock().unwrap() = Some(cfg.clone());
             // Сессия стартует на ANNOUNCE (решение по 7.1.431), PLAY просто 200.
@@ -228,6 +229,7 @@ fn parse_announce(body: &[u8]) -> AnnounceConfig {
                 cfg.fec_min_required = val.parse().unwrap_or(0)
             }
             "x-nv-general.useReliableUdp" => cfg.use_reliable_udp = val.parse().unwrap_or(1),
+            "x-nv-general.featureFlags" => cfg.feature_flags = val.parse().unwrap_or(0),
             "x-ss-general.encryptionEnabled" => cfg.encryption_enabled = val.parse().unwrap_or(0),
             "x-nv-audio.surround.numChannels" => {
                 cfg.audio_channels = val.parse().unwrap_or(2)

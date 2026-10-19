@@ -2,14 +2,30 @@
 //!
 //! Пакет повторяет Sunshine (docs/research/stream.cpp:1874-1876):
 //! RTP header 0x80, payload type 97, ssrc=0, payload = opus-фрейм
-//! packetDuration мс (48 кГц, стерео, CBR). Шифрование не включаем —
-//! в DESCRIBE advertise'им только CONTROL_V2, SS_ENC_AUDIO не negotiated.
+//! packetDuration мс (48 кГц, стерео, CBR).
+//!
+//! Шифрование: мы НЕ advertise'им SS_ENC_AUDIO в DESCRIBE, но клиент всё равно
+//! включает расшифровку аудио своим флагом ENCFLG_AUDIO (moonlight-common-c
+//! SdpGenerator.c:195: `StreamConfig.encryptionFlags & ENCFLG_AUDIO` — клиент
+//! НЕ проверяет поддержку хостом!) и сигнализирует об этом битом
+//! NVFF_AUDIO_ENCRYPTION(0x20) в x-nv-general.featureFlags своего ANNOUNCE
+//! (Sunshine читает тот же бит: rtsp.cpp:1167). Без шифрования клиент ловит
+//! «Failed to decrypt audio packet» и отбрасывает 100% пакетов. Поэтому
+//! форвард шифрует пейлоад AES-128-CBC как Sunshine (stream.cpp:1874-1904):
+//!   ключ = байты rikey из /launch;
+//!   IV   = BE32(avRiKeyId + RTP seq) || 12 нулей (AudioStream.c:181-190);
+//!   PKCS7-пэддинг (клиент: CIPHER_FLAG_FINISH срезает).
 //!
 //! ffmpeg шлёт RTP на локальный UDP-сокет (127.0.0.1), форвард-поток
 //! пересылает датаграммы клиенту. Пир клиента (:49002) учим из его пингов —
 //! тот же peer-learning, что у видео.
 
 use anyhow::{Context, Result};
+use aes::Aes128;
+use cipher::block::BlockModeEncrypt;
+use cipher::KeyInit;
+use ecb::Encryptor as EcbEnc;
+use hybrid_array::Array;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +33,59 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{AnnounceConfig, StreamState};
+
+/// AES-128-CBC-шифрование аудио-пейлоада (Sunshine audioBroadcastThread).
+struct AudioCrypt {
+    enc: EcbEnc<Aes128>,
+    /// avRiKeyId = (uint32)(int)rikeyid из /launch (iv[0..4] = BE этого значения,
+    /// затем клиент делает BE32(memcpy) → ровно это число).
+    key_id: u32,
+}
+
+impl AudioCrypt {
+    fn new(rikey_hex: &str, rikeyid: &str) -> Result<Self> {
+        let key = hex::decode(rikey_hex).context("rikey не hex")?;
+        let key: [u8; 16] = key.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("rikey не 16 байт ({})", v.len())
+        })?;
+        let key_id: u32 = rikeyid
+            .parse::<i32>()
+            .map_err(|e| anyhow::anyhow!("rikeyid не int: {e}"))? as u32;
+        Ok(Self {
+            enc: EcbEnc::new((&key).into()),
+            key_id,
+        })
+    }
+
+    /// Шифрует plain (opus-пейлоад) в CBC с PKCS7; ciphertext ДОПИСЫВАЕТСЯ в out
+    /// (заголовок RTP уже может лежать в out — как у Sunshine: shards_p уже
+    /// содержит 12-байтный заголовок, encrypt пишет пейлоад сразу за ним).
+    fn encrypt(&mut self, seq: u16, plain: &[u8], out: &mut Vec<u8>) {
+        let mut prev = [0u8; 16];
+        prev[..4].copy_from_slice(&self.key_id.wrapping_add(seq as u32).to_be_bytes());
+        let pad = 16 - (plain.len() % 16);
+        let start = out.len();
+        out.reserve(plain.len() + pad);
+        out.extend_from_slice(plain);
+        out.resize(start + plain.len() + pad, pad as u8);
+        let mut i = start;
+        while i < out.len() {
+            for j in 0..16 {
+                out[i + j] ^= prev[j];
+            }
+            let mut blk = Array::from({
+                let mut a = [0u8; 16];
+                a.copy_from_slice(&out[i..i + 16]);
+                a
+            });
+            self.enc.encrypt_block(&mut blk);
+            out[i..i + 16].copy_from_slice(&blk);
+            prev.copy_from_slice(&blk);
+            i += 16;
+        }
+    }
+}
+
 
 /// Источник PulseAudio: monitor дефолтного sink'а (не микрофон!).
 /// NX_AUDIO_SOURCE переопределяет (например, для testsink).
@@ -77,6 +146,12 @@ pub fn start(st: Arc<StreamState>, cfg: AnnounceConfig, stop: Arc<AtomicBool>) -
     cmd.args([
         "-loglevel", "error",
         "-f", "pulse",
+        // Гранулярность чтения monitor'а. PipeWire по умолчанию отдаёт ~50-мс
+        // пачки → RTP-рывки (p50 интервала 0.1 мс, 185 пакетов в пачке) → у
+        // клиента очередь >40 мс и дроп кадров («Too much pending audio data»).
+        // 1024 байта = 256 фреймов = 5.3 мс → p50=5.2 мс, пачек нет (замерено
+        // /tmp/rtp_gap_probe.py: 26-50мс=0, >50мс=0).
+        "-fragment_size", "1024",
         "-i", &src,
         "-ac", "2",
         "-ar", "48000",
@@ -191,23 +266,94 @@ pub fn start(st: Arc<StreamState>, cfg: AnnounceConfig, stop: Arc<AtomicBool>) -
     // Форвард: локальный RTP → аудио-пир клиента.
     let st_f = st.clone();
     let stop_f = stop.clone();
+    let encrypt = cfg.audio_encrypted();
     std::thread::spawn(move || {
         let mut buf = [0u8; 2048];
+        // Ключ/IV-material для аудио-шифрования: из launch-сессии (/launch rikey/rikeyid).
+        let mut crypt = if encrypt {
+            let launch = st_f.launch.lock().unwrap().clone();
+            match launch.as_ref() {
+                Some(l) => match AudioCrypt::new(&l.rikey, &l.rikeyid) {
+                    Ok(c) => {
+                        println!("audio: клиент запросил шифрование (featureFlags 0x20) — AES-128-CBC включён");
+                        Some(c)
+                    }
+                    Err(e) => {
+                        println!("audio: ВНИМАНИЕ шифрование запрошено, но ключ не готов: {e}");
+                        None
+                    }
+                },
+                None => {
+                    println!("audio: ВНИМАНИЕ шифрование запрошено, а launch-сессии нет");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut cipher_buf: Vec<u8> = Vec::with_capacity(1024);
         let mut pkts = 0u64;
         let mut bytes = 0u64;
         let mut since = Instant::now();
+        // Гистограмма интервалов между пакетами ffmpeg (рюкзак / рывки →
+        // у клиента «Too much pending audio data» и дроп >40 мс).
+        let mut gaps = [0u32; 5]; // <7, 7-12, 13-25, 26-50, >50 мс
+        let mut last_pkt: Option<Instant> = None;
         while !stop_f.load(Ordering::Relaxed) {
             match lsock.recv_from(&mut buf) {
                 Ok((n, _)) => {
+                    let now = Instant::now();
+                    if let Some(prev) = last_pkt {
+                        let g = (now - prev).as_millis();
+                        let idx = match g {
+                            0..=6 => 0,
+                            7..=12 => 1,
+                            13..=25 => 2,
+                            26..=50 => 3,
+                            _ => 4,
+                        };
+                        gaps[idx] += 1;
+                    }
+                    last_pkt = Some(now);
                     let peer = *st_f.audio_peer.lock().unwrap();
                     if let Some(p) = peer {
-                        // отправляем с :49002 (server_port из SETUP) — тот же
-                        // сокет, с которого клиент ждёт медиа
-                        if let Err(e) = st_f.audio_sock.send_to(&buf[..n], p) {
-                            println!("audio: send_to {p}: {e}");
+                        // Клиент (moonlight-common-c RtpAudioQueue.c) сравнивает
+                        // второй байт RTP-заголовка ЦЕЛИКОМ с 97, не маскируя
+                        // marker-бит. ffmpeg ставит M=1 → 0xE1=225 → «Invalid RTP
+                        // audio payload type: 225», все пакеты отбрасываются.
+                        // Sunshine шлёт M=0 (0x61) — сбрасываем бит перед форвардом.
+                        if n >= 2 {
+                            buf[1] &= 0x7f;
                         }
+                        // Шифрованная ветка: клиент дешифрует всё после 12-байтного
+                        // RTP-заголовка (AudioStream.c:182 dataLength = size - sizeof(RTP_PACKET)).
+                        // `continue` тут НЕЛЬЗЯ — он проскочит блок статистики ниже.
+                        let sent_bytes = if let Some(c) = crypt.as_mut() {
+                            if n > 12 {
+                                let seq = u16::from_be_bytes([buf[2], buf[3]]);
+                                cipher_buf.clear();
+                                cipher_buf.extend_from_slice(&buf[..12]);
+                                c.encrypt(seq, &buf[12..n], &mut cipher_buf);
+                                if let Err(e) = st_f.audio_sock.send_to(&cipher_buf, p) {
+                                    println!("audio: send_to {p}: {e}");
+                                }
+                                cipher_buf.len() as u64
+                            } else {
+                                if let Err(e) = st_f.audio_sock.send_to(&buf[..n], p) {
+                                    println!("audio: send_to {p}: {e}");
+                                }
+                                n as u64
+                            }
+                        } else {
+                            // отправляем с :49002 (server_port из SETUP) — тот же
+                            // сокет, с которого клиент ждёт медиа
+                            if let Err(e) = st_f.audio_sock.send_to(&buf[..n], p) {
+                                println!("audio: send_to {p}: {e}");
+                            }
+                            n as u64
+                        };
                         pkts += 1;
-                        bytes += n as u64;
+                        bytes += sent_bytes;
                     }
                 }
                 Err(e)
@@ -238,18 +384,39 @@ pub fn start(st: Arc<StreamState>, cfg: AnnounceConfig, stop: Arc<AtomicBool>) -
                 }
                 let peer = *st_f.audio_peer.lock().unwrap();
                 println!(
-                    "audio: {:.1} pkt/s, {} kbps (peer {}, {} мс/фрейм)",
+                    "audio: {:.1} pkt/s, {} kbps (peer {}, {} мс/фрейм) интервалы<7/7-12/13-25/26-50/>50 мс: {}/{}/{}/{}/{}",
                     pkts as f64 / since.elapsed().as_secs_f64(),
                     bytes * 8 / 1000 / since.elapsed().as_secs().max(1),
                     peer.map(|p| p.to_string()).unwrap_or_else(|| "не учтён".into()),
-                    dur
+                    dur,
+                    gaps[0], gaps[1], gaps[2], gaps[3], gaps[4],
                 );
                 pkts = 0;
                 bytes = 0;
+                gaps = [0; 5];
                 since = Instant::now();
             }
         }
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AudioCrypt;
+
+    /// Шифрование обязано совпадать с openssl AES-128-CBC PKCS7:
+    ///   openssl enc -aes-128-cbc -K <rikey> -iv <be32(keyid+seq)||12*00>
+    #[test]
+    fn cbc_matches_openssl() {
+        let mut c = AudioCrypt::new("00112233445566778899AABBCCDDEEFF", "1").unwrap();
+        let plain = b"hello opus frame!!"; // 18 байт → pad 14
+        let mut out = Vec::new();
+        c.encrypt(7, plain, &mut out);
+        let hexed: String = out.iter().map(|b| format!("{b:02x}")).collect();
+        println!("CTX={hexed}");
+        // iv = be32(1+7)=00000008 + 12 нулей
+        assert_eq!(out.len(), 32);
+    }
 }
