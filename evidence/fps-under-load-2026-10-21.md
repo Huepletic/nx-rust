@@ -1,6 +1,6 @@
 # Почему fps падал до 20–40 и что с этим сделано
 
-Дата: 2026-10-21 (ночь). Хост: archpizdetc, Arch, 4 ядра, AMD Carrizo APU (iGPU),
+Дата: 2026-10-21 (ночь). Хост: nx-host, Arch, 4 ядра, AMD Carrizo APU (iGPU),
 Hyprland 0.56.2, мониторы eDP-1 1920x1080 и HEADLESS-1 1088x800 (scale 0.8).
 Планшет-клиент: GSI Treble Android 11, com.limelight.
 

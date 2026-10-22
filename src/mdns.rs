@@ -217,7 +217,7 @@ fn build_response(questions: &[(String, u16, bool)], hostname: &str, port: u16, 
     for (name, qtype, _) in questions {
         let name = name.as_str();
         let qtype = *qtype;
-        // Клиент спрашивает и об ИНСТАНСЕ (archpizdetc._nvstream._tcp.local),
+        // Клиент спрашивает и об ИНСТАНСЕ (nx-host._nvstream._tcp.local),
         // и о САМОМ СЕРВИСЕ (_nvstream._tcp.local) — это browsing: на SRV/TXT
         // сервиса отвечаем записями инстанса (так делал python-прототип).
         let service = name == normalize(SVC_TYPE)

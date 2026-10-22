@@ -58,22 +58,59 @@ pub fn start(st: &Arc<StreamState>, cfg: AnnounceConfig) -> Result<()> {
 
     // Режим энкодера: NX_ENCODER=vaapi — собственный in-process VA-API энкодер
     // (zero-copy dmabuf→VPP→H.264, без ffmpeg-процесса); дефолт ffmpeg.
+    // Портал/X11 отдают BGRA из памяти, поэтому in-process VA-API (dmabuf)
+    // для них не подходит — принудительно идём через ffmpeg.
+    let backend = probes::backend_for(&st.output);
     let enc_mode = std::env::var("NX_ENCODER").as_deref().unwrap_or("ffmpeg").to_string();
     if enc_mode == "vaapi" {
-        match start_vaapi(st.clone(), cfg.clone(), cw, ch, tw, th, fps, bitrate_k) {
-            Ok(()) => return Ok(()),
-            Err(e) => println!("vaapi: не удалось запустить ({e:#}) — фоллбек на ffmpeg"),
+        if backend == probes::Backend::Wlr {
+            match start_vaapi(st.clone(), cfg.clone(), cw, ch, tw, th, fps, bitrate_k) {
+                Ok(()) => return Ok(()),
+                Err(e) => println!("vaapi: не удалось запустить ({e:#}) — фоллбек на ffmpeg"),
+            }
+        } else {
+            println!(
+                "stream: backend {} → ffmpeg (in-process VA-API требует dmabuf)",
+                backend.name()
+            );
         }
     }
 
-    // Конвейер целиком на GPU: hwupload поднимает BGRA-кадр в VAAPI-поверхность,
-    // а scale_vaapi делает И масштаб, И конверсию BGRA->NV12. Раньше конверсия
-    // NV12 шла на CPU (swscale) и была узким местом: ~13 fps против ~35 fps.
-    let vf = if (tw, th) != (cw, ch) {
-        format!("hwupload,scale_vaapi=format=nv12:w={}:h={}", tw, th)
-    } else {
-        "hwupload,scale_vaapi=format=nv12".to_string()
+    let enc_req = std::env::var("NX_FFMPEG_ENCODER")
+        .unwrap_or_else(|_| "auto".to_string())
+        .to_ascii_lowercase();
+    let vaapi_dev =
+        std::env::var("NX_VAAPI_DEVICE").unwrap_or_else(|_| "/dev/dri/renderD128".to_string());
+    let have_vaapi = match enc_req.as_str() {
+        "x264" | "libx264" | "software" => false,
+        "vaapi" | "h264_vaapi" => true,
+        _ => vaapi_encode_available(&vaapi_dev),
     };
+    let enc_name = if have_vaapi { "h264_vaapi" } else { "libx264" };
+
+    // VA-API: hwupload поднимает BGRA-кадр в VAAPI-поверхность, scale_vaapi
+    // делает И масштаб, И конверсию BGRA->NV12. X11/портал на машине без
+    // VA-API (или по NX_FFMPEG_ENCODER=x264) — программный libx264.
+    let vf = if have_vaapi {
+        if (tw, th) != (cw, ch) {
+            format!("hwupload,scale_vaapi=format=nv12:w={}:h={}", tw, th)
+        } else {
+            "hwupload,scale_vaapi=format=nv12".to_string()
+        }
+    } else if (tw, th) != (cw, ch) {
+        format!("scale={}:{},format=yuv420p", tw, th)
+    } else {
+        "format=yuv420p".to_string()
+    };
+    println!(
+        "stream: backend={} encoder={} {}x{} → {}x{}",
+        backend.name(),
+        enc_name,
+        cw,
+        ch,
+        tw,
+        th
+    );
     let mut enc_cmd = Command::new("ffmpeg");
     enc_cmd
         .args([
@@ -86,11 +123,13 @@ pub fn start(st: &Arc<StreamState>, cfg: AnnounceConfig) -> Result<()> {
             "-framerate",
             &fps.to_string(),
             "-i", "pipe:0",
-            "-vaapi_device", "/dev/dri/renderD128",
-        ])
-        .args([
-            "-vf",
-            &vf,
+        ]);
+    if have_vaapi {
+        enc_cmd.args(["-vaapi_device", &vaapi_dev]);
+    }
+    enc_cmd.args(["-vf", &vf]);
+    if have_vaapi {
+        enc_cmd.args([
             "-c:v", "h264_vaapi",
             // Низкая латентность: CBR с маленьким VBV, без очереди кадров.
             "-rc_mode", "CBR",
@@ -104,9 +143,24 @@ pub fn start(st: &Arc<StreamState>, cfg: AnnounceConfig) -> Result<()> {
             "-g",
             &GOP.to_string(),
             "-bf", "0", // без B-frames — низкая латентность
-            "-f", "h264",
-            "pipe:1",
         ]);
+    } else {
+        enc_cmd.args([
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-b:v",
+            &format!("{}k", bitrate_k),
+            "-maxrate",
+            &format!("{}k", bitrate_k),
+            "-bufsize",
+            &format!("{}k", (bitrate_k / 2).max(500)),
+            "-g",
+            &GOP.to_string(),
+            "-bf", "0",
+        ]);
+    }
+    enc_cmd.args(["-f", "h264", "pipe:1"]);
     // Живой тюнинг энкодера без пересборки: NX_ENC_EXTRA="-quality 4 -profile main"
     if let Ok(extra) = std::env::var("NX_ENC_EXTRA") {
         enc_cmd.args(extra.split_whitespace());
@@ -118,7 +172,7 @@ pub fn start(st: &Arc<StreamState>, cfg: AnnounceConfig) -> Result<()> {
             std::fs::File::create("/tmp/nx-ffmpeg.log").context("создание /tmp/nx-ffmpeg.log")?,
         ))
         .spawn()
-        .context("запуск ffmpeg (h264_vaapi)")?;
+        .context(format!("запуск ffmpeg ({enc_name})"))?;
     let mut stdin = enc.stdin.take().context("ffmpeg stdin")?;
     let stdout = enc.stdout.take().context("ffmpeg stdout")?;
     // Pipe stdin 4 МБ: дефолт 64 КБ разбивает write_all 3.48-МБ кадра на ~55
@@ -248,6 +302,27 @@ pub fn start(st: &Arc<StreamState>, cfg: AnnounceConfig) -> Result<()> {
         cw, ch, fps, tw, th, bitrate_k, cfg.packet_size
     );
     Ok(())
+}
+
+/// Проверка, что VA-API умеет H.264 encode, а не только декодирование.
+/// NVIDIA/nvidia-vaapi-driver и некоторые Intel/AMD конфигурации отдают
+/// render node, но h264_vaapi падает; тогда лучше сразу libx264.
+fn vaapi_encode_available(dev: &str) -> bool {
+    if !std::path::Path::new(dev).exists() {
+        return false;
+    }
+    match Command::new("vainfo").output() {
+        Ok(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            out.status.success()
+                && text.contains("VAEntrypointEncSlice")
+                && text.contains("VAProfileH264")
+        }
+        // vainfo не установлен — оптимистично пробуем VA-API; если ffmpeg
+        // не сможет, пользователь увидит ошибку и задаст NX_FFMPEG_ENCODER=x264.
+        Err(_) => true,
+    }
 }
 
 /// Zero-copy ветка: собственный VA-API энкодер (dmabuf → VPP → H.264 → RTP)

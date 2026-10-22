@@ -31,34 +31,75 @@ else
 fi
 
 sec "2. Сессия и композитор"
-info "XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-?}  XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-?}  WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-?}"
-if [ "${XDG_SESSION_TYPE:-}" = "wayland" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
-  ok "Wayland-сессия"
-else
-  fail "нет Wayland-сессии (сервер работает только через wlr-screencopy)"
+info "XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-?}  XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-?}  WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-?}  DISPLAY=${DISPLAY:-?}"
+BACKEND=""
+if [ -x target/release/nx-server ]; then
+  BACKEND=$(target/release/nx-server backend 2>/dev/null || true)
 fi
-
-if command -v wayland-info >/dev/null 2>&1; then
-  if wayland-info 2>/dev/null | grep -q zwlr_screencopy_manager_v1; then
-    ok "композитор отдаёт zwlr_screencopy_manager_v1"
-  else
-    fail "нет zwlr_screencopy_manager_v1 — захват не поддерживается (KDE/GNOME?)"
-  fi
-elif command -v hyprctl >/dev/null 2>&1; then
-  ok "hyprctl найден (протокол не проверить: установите wayland-utils)"
+if [ -n "$BACKEND" ]; then
+  ok "backend: $BACKEND"
 else
-  fail "нет wayland-info и hyprctl — compositor не проверить"
+  warn "backend не определён (бинарник старый/не собран) — проверяю окружение"
 fi
-
-case "${XDG_CURRENT_DESKTOP:-}" in
-  *KDE*|*Plasma*)
-    fail "KDE/KWin не реализует wlr-screencopy: нужен wlroots-композитор (Hyprland/Sway)"
+case "$BACKEND" in
+  "xdg-desktop-portal/PipeWire")
+    if command -v busctl >/dev/null 2>&1 && \
+       busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.ScreenCast >/dev/null 2>&1; then
+      ok "портал ScreenCast доступен (org.freedesktop.portal.Desktop)"
+    else
+      fail "нет ScreenCast в xdg-desktop-portal (нужен xdg-desktop-portal-kde/gnome)"
+    fi
+    if pgrep -x pipewire >/dev/null 2>&1; then
+      ok "PipeWire работает"
+    else
+      fail "PipeWire не запущен (портал ScreenCast не отдаст кадры)"
+    fi
+    if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libpipewire-0.3; then
+      ok "libpipewire-0.3 (dev) есть"
+    else
+      warn "нет libpipewire-0.3 dev — сборка с порталом не пройдёт"
+    fi
     ;;
-  *GNOME*)
-    fail "GNOME/Mutter не реализует wlr-screencopy: нужен wlroots-композитор"
+  "x11grab")
+    if [ -n "${DISPLAY:-}" ]; then
+      ok "X11 DISPLAY=$DISPLAY"
+    else
+      fail "нет DISPLAY"
+    fi
+    if command -v xrandr >/dev/null 2>&1 && xrandr --current >/dev/null 2>&1; then
+      ok "xrandr отвечает"
+    else
+      fail "xrandr не отвечает"
+    fi
+    if command -v ffmpeg >/dev/null 2>&1 && ffmpeg -hide_banner -devices 2>/dev/null | grep -q x11grab; then
+      ok "ffmpeg умеет x11grab"
+    else
+      fail "ffmpeg без x11grab (нужен ffmpeg с libxcb)"
+    fi
+    ;;
+  "wlr-screencopy")
+    if command -v wayland-info >/dev/null 2>&1; then
+      if wayland-info 2>/dev/null | grep -q zwlr_screencopy_manager_v1; then
+        ok "композитор отдаёт zwlr_screencopy_manager_v1"
+      else
+        fail "нет zwlr_screencopy_manager_v1"
+      fi
+    elif command -v hyprctl >/dev/null 2>&1; then
+      ok "hyprctl найден (протокол не проверить: установите wayland-utils)"
+    else
+      warn "нет wayland-info/hyprctl — протокол не проверить"
+    fi
+    ;;
+  *)
+    if [ "${XDG_SESSION_TYPE:-}" = "wayland" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+      ok "Wayland-сессия"
+    elif [ -n "${DISPLAY:-}" ]; then
+      ok "X11-сессия"
+    else
+      fail "нет ни Wayland, ни X11"
+    fi
     ;;
 esac
-
 if command -v hyprctl >/dev/null 2>&1; then
   if hyprctl monitors -j 2>/dev/null | grep -q 'HEADLESS-'; then
     ok "виртуальный вывод HEADLESS-* уже есть"
@@ -71,22 +112,25 @@ sec "3. VA-API / энкодер"
 if [ -e /dev/dri/renderD128 ]; then
   ok "/dev/dri/renderD128 доступен"
 else
-  fail "нет /dev/dri/renderD128 (нужен VA-API render node)"
+  warn "нет /dev/dri/renderD128 — будет libx264 (медленнее; NX_FFMPEG_ENCODER=x264)"
 fi
 if command -v vainfo >/dev/null 2>&1; then
   if vainfo 2>/dev/null | grep -q 'VAProfileH264High.*VAEntrypointEncSlice'; then
     ok "VA-API H.264 High encode"
   else
-    fail "VA-API не умеет H.264 High encode"
+    warn "VA-API не умеет H.264 High encode — нужен x264 fallback"
   fi
 else
   warn "vainfo не установлен (пакет libva-utils)"
 fi
 if command -v ffmpeg >/dev/null 2>&1; then
-  if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q h264_vaapi; then
+  encs=$(ffmpeg -hide_banner -encoders 2>/dev/null || true)
+  if echo "$encs" | grep -q h264_vaapi; then
     ok "ffmpeg умеет h264_vaapi"
+  elif echo "$encs" | grep -q libx264; then
+    warn "ffmpeg без h264_vaapi — будет libx264"
   else
-    fail "ffmpeg без h264_vaapi"
+    fail "ffmpeg без h264_vaapi/libx264"
   fi
 else
   fail "ffmpeg не установлен"

@@ -58,7 +58,7 @@ C-пробник в тех же условиях: 36.77 мс/кадр (evidence 
 - Watchdog: `stream_active()`/`live_ffmpeg_pid()` умеют heartbeat `/tmp/nx-vaapi-alive` (обновление 1с, возраст <5с = жив; sentinel pid=-1). Лог writer в формате "(всего N)" — last_writer_total работает без правок.
 - Дедлок: 4 раздельных `st.launch.lock()` при построении launch_s после spawn capture-потока → заменены на один lock+clone. Симптом: capture писал в пайп, RTP-поток не спавнился, ANNOUNCE-ответ не уходил.
 - stream_sim: **ALL PASS** (RTP кадр 0 = 21 чанк, NAL [7,8,5]).
-- Живой планшет (Moonlight, adb-автозапуск PcView → archpizdetc → Desktop): стрим идёт, картинка живая (скрин 2176x1600, 54 градаций яркости), ввод идёт (input-фреймы в логе).
+- Живой планшет (Moonlight, adb-автозапуск PcView → nx-host → Desktop): стрим идёт, картинка живая (скрин 2176x1600, 54 градаций яркости), ввод идёт (input-фреймы в логе).
 - Устойчивые метрики под load: capture 59.8 fps, sink(VPP+encode+pipe) 6.66 мс/кадр, rtp 1.4 Мбит/с на статике (у ffmpeg на статике 1.0–1.5 — паритет).
 - Debug-принты убраны, release пересобран (вступит при следующем рестарте; текущий стрим не рвался).
 

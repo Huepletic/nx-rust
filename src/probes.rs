@@ -503,8 +503,151 @@ pub fn copy_bench(want: &str, n: usize) -> Result<()> {
     Ok(())
 }
 
+/// Откуда берём кадры. KWin на Wayland не умеет zwlr-screencopy, поэтому
+/// для KDE/GNOME используется xdg-desktop-portal + PipeWire; для X11 — x11grab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Wlr,
+    Portal,
+    X11,
+}
+
+impl Backend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Wlr => "wlr-screencopy",
+            Backend::Portal => "xdg-desktop-portal/PipeWire",
+            Backend::X11 => "x11grab",
+        }
+    }
+}
+
+/// NX_CAPTURE=auto|wlr|portal|x11. Явное имя "portal"/"x11" тоже работает.
+pub fn backend_for(want: &str) -> Backend {
+    let forced = std::env::var("NX_CAPTURE")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match forced.as_str() {
+        "wlr" | "wayland" | "screencopy" => return Backend::Wlr,
+        "portal" | "pipewire" => return Backend::Portal,
+        "x11" | "xorg" => return Backend::X11,
+        _ => {}
+    }
+    match want {
+        "portal" => return Backend::Portal,
+        "x11" => return Backend::X11,
+        _ => {}
+    }
+
+    let session = session_type();
+    if session == "x11" {
+        return Backend::X11;
+    }
+    if has_wlr_screencopy().unwrap_or(false) {
+        return Backend::Wlr;
+    }
+    if session == "wayland" {
+        return Backend::Portal;
+    }
+
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let kde = desktop.contains("kde")
+        || desktop.contains("plasma")
+        || std::env::var("KDE_FULL_SESSION").as_deref() == Ok("true")
+        || std::env::var("DESKTOP_SESSION")
+            .map(|s| s.to_ascii_lowercase().contains("plasma"))
+            .unwrap_or(false);
+    let gnome = desktop.contains("gnome");
+    let has_wayland = !wayland_socket_names().is_empty();
+    if (kde || gnome) && has_wayland {
+        return Backend::Portal;
+    }
+    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return Backend::X11;
+    }
+    if has_wayland {
+        return Backend::Portal;
+    }
+    if std::env::var_os("DISPLAY").is_some() {
+        return Backend::X11;
+    }
+    // Последний шанс: пусть probe выдаст внятную ошибку про WAYLAND_DISPLAY.
+    Backend::Wlr
+}
+
+fn session_type() -> String {
+    if let Ok(s) = std::env::var("XDG_SESSION_TYPE") {
+        if !s.trim().is_empty() {
+            return s.trim().to_ascii_lowercase();
+        }
+    }
+    if let Ok(id) = std::env::var("XDG_SESSION_ID") {
+        if let Ok(out) = Command::new("loginctl")
+            .args(["show-session", &id, "-p", "Type", "--value"])
+            .output()
+        {
+            if out.status.success() {
+                return String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
+            }
+        }
+    }
+    String::new()
+}
+
+fn wayland_socket_names() -> Vec<String> {
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.starts_with("wayland-") && !n.ends_with(".lock") {
+                names.push(n);
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Есть ли в текущем compositor'е zwlr_screencopy_manager_v1.
+/// Отдельное соединение, без выбора output; KWin возвращает false.
+pub fn has_wlr_screencopy() -> Result<bool> {
+    let conn = Connection::connect_to_env().context("нет WAYLAND_DISPLAY")?;
+    let display = conn.display();
+    let mut event_queue = conn.new_event_queue();
+    let qh = event_queue.handle();
+    let mut state = App {
+        shm: None,
+        screencopy_mgr: None,
+        dma_mgr: None,
+        compositor: None,
+        idle_inhibit_mgr: None,
+        outputs: Vec::new(),
+        frames: Default::default(),
+    };
+    let _registry = display.get_registry(&qh, ());
+    event_queue.roundtrip(&mut state)?;
+    event_queue.roundtrip(&mut state)?;
+    Ok(state.screencopy_mgr.is_some())
+}
+
 /// Размер первого кадра output (pipeline: узнать w/h до запуска ffmpeg).
+/// Для KDE/GNOME здесь открывается портал (диалог выбора экрана); для X11 —
+/// xrandr.
 pub fn probe_output_size(want: &str) -> Result<(u32, u32)> {
+    match backend_for(want) {
+        Backend::Portal => return crate::portal::open_capture(),
+        Backend::X11 => return x11_screen_size(),
+        Backend::Wlr => {}
+    }
+    wlr_probe_output_size(want)
+}
+
+fn wlr_probe_output_size(want: &str) -> Result<(u32, u32)> {
     let conn = Connection::connect_to_env().context("нет WAYLAND_DISPLAY")?;
     let display = conn.display();
     let mut event_queue = conn.new_event_queue();
@@ -532,6 +675,169 @@ pub fn probe_output_size(want: &str) -> Result<(u32, u32)> {
     let p = state.frames[0].params.context("нет buffer_params")?;
     frame.destroy();
     Ok((p.width, p.height))
+}
+
+/// Размер X11-экрана (KDE Plasma X11 / любой Xorg). xrandr --current даёт
+/// размер всего Screen, а не одного монитора: x11grab снимает весь экран.
+pub fn x11_screen_size() -> Result<(u32, u32)> {
+    if std::env::var_os("DISPLAY").is_none() {
+        bail!("X11: не задан DISPLAY");
+    }
+    if let Ok(out) = Command::new("xrandr").arg("--current").output() {
+        if out.status.success() {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            if let Some(v) = parse_xrandr_current(&txt) {
+                return Ok(v);
+            }
+            if let Some(v) = parse_xrandr_connected(&txt) {
+                return Ok(v);
+            }
+        }
+    }
+    if let Ok(out) = Command::new("xdpyinfo").output() {
+        if out.status.success() {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            for line in txt.lines() {
+                if !line.contains("dimensions:") {
+                    continue;
+                }
+                for tok in line.split_whitespace() {
+                    if let Some(v) = parse_x11_geometry(tok) {
+                        return Ok(v);
+                    }
+                }
+            }
+        }
+    }
+    bail!("X11: не удалось определить размер экрана (xrandr/xdpyinfo)")
+}
+
+fn parse_u32_token(tok: &str) -> Option<u32> {
+    let digits: String = tok.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn parse_xrandr_current(txt: &str) -> Option<(u32, u32)> {
+    for line in txt.lines() {
+        let Some(pos) = line.find("current ") else {
+            continue;
+        };
+        let rest = &line[pos + "current ".len()..];
+        let mut it = rest.split_whitespace();
+        let w = parse_u32_token(it.next()?)?;
+        if it.next()? != "x" {
+            continue;
+        }
+        let h = parse_u32_token(it.next()?)?;
+        if w > 0 && h > 0 {
+            return Some((w, h));
+        }
+    }
+    None
+}
+
+fn parse_x11_geometry(tok: &str) -> Option<(u32, u32)> {
+    let x = tok.find('x')?;
+    let w: u32 = tok[..x]
+        .trim_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .ok()?;
+    let rest = &tok[x + 1..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let h: u32 = rest[..end].parse().ok()?;
+    if w > 0 && h > 0 { Some((w, h)) } else { None }
+}
+
+fn parse_xrandr_connected(txt: &str) -> Option<(u32, u32)> {
+    for line in txt.lines() {
+        if !line.contains(" connected") {
+            continue;
+        }
+        for tok in line.split_whitespace() {
+            if let Some(v) = parse_x11_geometry(tok) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// X11-захват: отдельный ffmpeg x11grab → raw BGRA в общий pipeline.
+/// На KDE Plasma X11 это единственный путь: wlr-screencopy там нет,
+/// а портал ScreenCast на X11 не обязателен.
+fn x11_capture_loop<F>(
+    fps: u32,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut sink: F,
+) -> Result<()>
+where
+    F: FnMut(FrameRef) -> Result<()>,
+{
+    use std::sync::atomic::Ordering;
+
+    let (w, h) = x11_screen_size()?;
+    let display = std::env::var("DISPLAY").context("X11: нет DISPLAY")?;
+    let fps = fps.max(1);
+    let log_path = std::env::var("NX_X11GRAB_LOG")
+        .unwrap_or_else(|_| "/tmp/nx-x11grab.log".to_string());
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "x11grab",
+        "-framerate",
+        &fps.to_string(),
+        "-video_size",
+        &format!("{}x{}", w, h),
+        "-i",
+        &format!("{}+0,0", display),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgra",
+        "-",
+    ])
+    .stdout(Stdio::piped());
+    if let Ok(f) = std::fs::File::create(&log_path) {
+        cmd.stderr(Stdio::from(f));
+    } else {
+        cmd.stderr(Stdio::null());
+    }
+    let mut child = cmd.spawn().context("запуск ffmpeg x11grab")?;
+    let mut stdout = child.stdout.take().context("x11grab: нет stdout")?;
+    let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+    let mut result = Ok(());
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match stdout.read_exact(&mut buf) {
+            Ok(()) => {
+                if let Err(e) = sink(FrameRef::Bgra(&buf, w, h)) {
+                    result = Err(e);
+                    break;
+                }
+            }
+            Err(e) => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                result = Err(anyhow::anyhow!(
+                    "ffmpeg x11grab: {e} (лог {})",
+                    log_path
+                ));
+                break;
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 /// Захват ТОЙ ЖЕ веткой `capture_loop`, но sink молчит (нет ffmpeg, нет RTP) —
@@ -565,10 +871,28 @@ pub fn capture_bench(want: &str, secs: u64) -> Result<()> {
     Ok(())
 }
 
+/// Захват в цикле с пейсингом по fps; backend выбирается автоматически.
+pub fn capture_loop<F>(
+    want: &str,
+    fps: u32,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sink: F,
+) -> Result<()>
+where
+    F: FnMut(FrameRef) -> Result<()>,
+{
+    match backend_for(want) {
+        Backend::Portal => return crate::portal::capture_loop(fps, stop, sink),
+        Backend::X11 => return x11_capture_loop(fps, stop, sink),
+        Backend::Wlr => {}
+    }
+    wlr_capture_loop(want, fps, stop, sink)
+}
+
 /// Захват в цикле с пейсингом по fps; каждый кадр отдаётся в sink как BGRA
 /// (альфа не важна — свес в YUV её игнорирует).
 /// stride == w*4 → отдаём mmap напрямую (XRGB8888 LE байтово = BGRA), иначе построчный копир.
-pub fn capture_loop<F>(
+fn wlr_capture_loop<F>(
     want: &str,
     fps: u32,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1274,5 +1598,56 @@ impl Dispatch<ZwpLinuxBufferParamsV1, usize> for App {
             ParamsEvent::Failed => { state.frames[*slot].dma_failed = true; }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn x11_parsers() {
+        assert_eq!(
+            parse_xrandr_current("Screen 0: minimum 320 x 200, current 1920 x 1080, maximum 16384 x 16384"),
+            Some((1920, 1080))
+        );
+        assert_eq!(
+            parse_x11_geometry("1920x1080+0+0"),
+            Some((1920, 1080))
+        );
+        assert_eq!(parse_x11_geometry("832x624"), Some((832, 624)));
+        assert_eq!(parse_x11_geometry("abc"), None);
+        assert_eq!(
+            crate::stream::input::parse_x11_rect("1920x1080+0+0"),
+            Some((0, 0, 1920, 1080))
+        );
+        assert_eq!(
+            crate::stream::input::parse_x11_rect("1920x1080+1920+0"),
+            Some((1920, 0, 1920, 1080))
+        );
+        assert_eq!(
+            crate::stream::input::parse_x11_rect("1920x1080+0+1080"),
+            Some((0, 1080, 1920, 1080))
+        );
+        assert_eq!(
+            crate::stream::input::parse_x11_rect("1920x1080-100+0"),
+            Some((-100, 0, 1920, 1080))
+        );
+        assert_eq!(
+            crate::stream::input::parse_x11_rect("1920/344x1080/193+0+0"),
+            Some((0, 0, 1920, 1080))
+        );
+    }
+
+    #[test]
+    fn forced_backend_overrides_everything() {
+        // NX_CAPTURE приоритетнее даже при полном отсутствии сессии.
+        std::env::set_var("NX_CAPTURE", "x11");
+        assert_eq!(backend_for("auto"), Backend::X11);
+        std::env::set_var("NX_CAPTURE", "portal");
+        assert_eq!(backend_for("whatever"), Backend::Portal);
+        std::env::set_var("NX_CAPTURE", "wlr");
+        assert_eq!(backend_for("HEADLESS-1"), Backend::Wlr);
+        std::env::remove_var("NX_CAPTURE");
     }
 }

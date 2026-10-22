@@ -41,3 +41,6 @@ serde_json = "1"
 # mDNS/DNS-SD (_nvstream._tcp): нужен SO_REUSEADDR/SO_REUSEPORT — порт 5353 уже
 # занят systemd-resolved, без REUSE bind не пройдёт (так же делал python-прототип).
 socket2 = "0.6"
+# KDE/GNOME Wayland: xdg-desktop-portal ScreenCast + PipeWire
+ashpd = { version = "0.13", features = ["screencast"] }
+pipewire = "0.9"

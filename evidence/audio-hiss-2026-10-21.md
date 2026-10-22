@@ -1,6 +1,6 @@
 # Шипение в аудио: разбор и починка
 
-Дата: 2026-10-21 (03:00). Хост: archpizdetc, Arch, 4 ядра, AMD Carrizo APU,
+Дата: 2026-10-21 (03:00). Хост: nx-host, Arch, 4 ядра, AMD Carrizo APU,
 Hyprland, PipeWire 1.6 + WirePlumber, мониторы eDP-1 (экран хоста) и
 HEADLESS-1 1088x800 (стрим). Клиент: планшет GSI, com.limelight 12.2 (315).
 

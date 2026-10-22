@@ -1,6 +1,6 @@
 # xHCI-контроллер хоста мёртв: диагностика и корневая причина
 
-Дата: 2026-10-20. Хост: archpizdetc (Lenovo, AMD Carrizo APU, FCH xHCI 0000:00:10.0).
+Дата: 2026-10-20. Хост: nx-host (Lenovo, AMD Carrizo APU, FCH xHCI 0000:00:10.0).
 
 ## Симптом
 
@@ -42,7 +42,7 @@ $ sudo dmesg | grep -i xhci | tail -6
 1. `rndis.gs4` на планшете отдаёт **два** USB-интерфейса:
    `0xE0` (Wireless, control-only) и `0x02` (CDC Data — реальный канал).
    На хосте это два netdev'а: `enp0s16u3` (0xE0) и `enp0s16u3i1` (0x02).
-2. Старый `watchdog.py` вешал адрес хоста (`192.168.178.1/24`) на **захардкоженный**
+2. Старый `watchdog.py` вешал адрес хоста (`192.0.2.1/24`) на **захардкоженный**
    `enp0s16u3` — то есть на control-интерфейс, который данных не несёт.
    Следствие на планшете: `rndis0` RX packets == RX errs (100% ошибок),
    на хосте TX-очередь `rndis_host` забивается → `NETDEV WATCHDOG: transmit queue 0 timed out`

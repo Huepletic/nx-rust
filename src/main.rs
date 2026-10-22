@@ -9,6 +9,7 @@
 mod dma;
 mod mdns;
 mod nvhttp;
+mod portal;
 mod probes;
 mod stream;
 mod vaapi;
@@ -50,6 +51,11 @@ fn main() -> Result<()> {
             let frames: usize = if args.len() > 2 { args[2].parse().context("frames")? } else { 5 };
             vaapi::selftest(frames)
         }
+        "backend" => {
+            let b = probes::backend_for("auto");
+            println!("{}", b.name());
+            Ok(())
+        }
         "serve" => serve_cmd(&args[2..]),
         _ => { usage(); }
     }
@@ -62,6 +68,7 @@ fn usage() -> ! {
          nx-server copybench <output|auto> <frames>\n  \
          nx-server capturebench <output|auto> <seconds>\n  \
          nx-server inputtest <output|auto>\n  \
+         nx-server backend\n  \
          nx-server serve [--pin NNNN] [--name HOSTNAME] [--http-port N] [--https-port N]"
     );
     std::process::exit(2);
@@ -77,6 +84,24 @@ fn capture_cmd(want: &str, out: &str) -> Result<()> {
 /// hyprctl нумерует headless-выводы монотонно и не переиспользует имена
 /// (HEADLESS-1, -2, -3…), поэтому фиксировать имя нельзя — ищем первый существующий.
 fn resolve_output(want: &str) -> Result<String> {
+    // KDE Plasma Wayland не умеет wlr-screencopy: там портал + PipeWire.
+    // KDE Plasma X11 снимаем через ffmpeg x11grab. В обоих случаях
+    // hyprctl/HEADLESS-* не нужны, выход — синтетическое имя backend'а.
+    let backend = probes::backend_for(want);
+    if backend != probes::Backend::Wlr {
+        let name = match backend {
+            probes::Backend::Portal => "portal",
+            probes::Backend::X11 => "x11",
+            probes::Backend::Wlr => unreachable!(),
+        };
+        println!(
+            "output: backend {} → '{}' (Hyprland headless не используется)",
+            backend.name(),
+            name
+        );
+        return Ok(name.to_string());
+    }
+
     if want != "auto" {
         if probes::probe_output_size(want).is_ok() {
             return Ok(want.to_string());

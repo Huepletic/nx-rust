@@ -21,17 +21,45 @@ SERVER_PIN="${NX_SERVER_PIN:-1234}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 
-# Если WAYLAND_DISPLAY не задан (запуск из systemd/watchdog), берём его из
-# окружения живого Hyprland — так не нужно угадывать wayland-0/wayland-1.
-if [ -z "${NX_WAYLAND_DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
-  WPID=$(pgrep -x Hyprland 2>/dev/null | head -1)
-  if [ -n "$WPID" ]; then
-    WAYLAND_DISPLAY=$(tr '\0' '\n' < "/proc/$WPID/environ" 2>/dev/null \
-      | sed -n 's/^WAYLAND_DISPLAY=//p' | head -1)
-  fi
+# Если WAYLAND_DISPLAY/XDG_SESSION_TYPE не заданы (запуск из systemd/watchdog),
+# берём их из окружения живой сессии. Hyprland — старый путь; KDE Plasma живёт
+# в plasmashell/ksmserver, GNOME — в gnome-shell. Это нужно только для
+# автоопределения backend'а: портал ScreenCast сам находит compositor по D-Bus
+# и WAYLAND_DISPLAY ему не требуется.
+SESSION_PID=""
+for p in Hyprland plasmashell ksmserver gnome-shell sway; do
+  SESSION_PID=$(pgrep -x "$p" 2>/dev/null | head -1)
+  [ -n "$SESSION_PID" ] && break
+done
+if [ -n "$SESSION_PID" ] && [ -r "/proc/$SESSION_PID/environ" ]; then
+  getenv() { tr '\0' '\n' < "/proc/$SESSION_PID/environ" 2>/dev/null | sed -n "s/^$1=//p" | head -1; }
+  [ -z "${XDG_SESSION_TYPE:-}" ] && XDG_SESSION_TYPE=$(getenv XDG_SESSION_TYPE)
+  [ -z "${XDG_CURRENT_DESKTOP:-}" ] && XDG_CURRENT_DESKTOP=$(getenv XDG_CURRENT_DESKTOP)
+  [ -z "${DISPLAY:-}" ] && DISPLAY=$(getenv DISPLAY)
+  [ -z "${WAYLAND_DISPLAY:-}" ] && WAYLAND_DISPLAY=$(getenv WAYLAND_DISPLAY)
+  [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && DBUS_SESSION_BUS_ADDRESS=$(getenv DBUS_SESSION_BUS_ADDRESS)
+  unset -f getenv
 fi
-WAYLAND_DISPLAY="${NX_WAYLAND_DISPLAY:-${WAYLAND_DISPLAY:-wayland-1}}"
-export WAYLAND_DISPLAY
+if [ -z "${XDG_SESSION_TYPE:-}" ]; then
+  XDG_SESSION_TYPE=$(loginctl show-session "${XDG_SESSION_ID:-}" -p Type --value 2>/dev/null || true)
+fi
+if [ -n "${NX_WAYLAND_DISPLAY:-}" ]; then
+  WAYLAND_DISPLAY="$NX_WAYLAND_DISPLAY"
+elif [ -z "${WAYLAND_DISPLAY:-}" ]; then
+  for s in wayland-0 wayland-1 wayland-2; do
+    if [ -S "$XDG_RUNTIME_DIR/$s" ]; then
+      WAYLAND_DISPLAY="$s"
+      break
+    fi
+  done
+fi
+if [ -n "${WAYLAND_DISPLAY:-}" ] && { [ -S "$WAYLAND_DISPLAY" ] || [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; }; then
+  export WAYLAND_DISPLAY
+else
+  unset WAYLAND_DISPLAY
+fi
+export XDG_SESSION_TYPE XDG_CURRENT_DESKTOP DISPLAY
+export DBUS_SESSION_BUS_ADDRESS
 
 cd "$SERVER_DIR" || exit 1
 pkill -x nx-server 2>/dev/null
@@ -58,11 +86,18 @@ if [ -n "$NX_IDX" ] && ! pactl list short sink-inputs | awk -F'\t' -v i="$NX_IDX
     >/dev/null 2>&1
 fi
 
+# KDE/GNOME: Hyprland-роутера нет. Снимаем monitor дефолтного sink'а — планшет
+# слышит весь звук хоста (и динамики хоста тоже играют; это ожидаемо). Если
+# NX_AUDIO_SOURCE задан явно (например, nx_stream.monitor), не переопределяем.
+if ! command -v hyprctl >/dev/null 2>&1 && [ -z "${NX_AUDIO_SOURCE:-}" ]; then
+  DEF_SINK=$(pactl get-default-sink 2>/dev/null || true)
+  [ -n "$DEF_SINK" ] && NX_AUDIO_SOURCE="${DEF_SINK}.monitor"
+fi
+NX_AUDIO_SOURCE="${NX_AUDIO_SOURCE:-nx_stream.monitor}"
+
 # Роутер: приложения с окнами на стрим-мониторе → nx_stream, остальные →
 # дефолтный sink. Без него весь звук десктопа дублируется на планшете.
-# Это Hyprland-специфичная часть; на KDE/другом композиторе её можно не
-# запускать (тогда NX_AUDIO_SOURCE лучше не задавать — возьмётся monitor
-# дефолтного sink'а).
+# Это Hyprland-специфичная часть; на KDE/другом композиторе её не запускаем.
 if [ "${NX_AUDIO_ROUTER:-1}" = "1" ] && command -v hyprctl >/dev/null 2>&1; then
   if ! pgrep -f 'nx_audio_rout[e]r' >/dev/null; then
     setsid python3 scripts/nx_audio_router.py >> /tmp/nx-audio-router.log 2>&1 < /dev/null &
@@ -70,16 +105,29 @@ if [ "${NX_AUDIO_ROUTER:-1}" = "1" ] && command -v hyprctl >/dev/null 2>&1; then
 fi
 
 SIG=$(ls -t "$XDG_RUNTIME_DIR/hypr/" 2>/dev/null | grep _ | head -1)
+if command -v hyprctl >/dev/null 2>&1; then
+  DEF_ENCODER=vaapi
+else
+  DEF_ENCODER=ffmpeg
+fi
 exec setsid env \
   XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-  WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+  WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+  DISPLAY="${DISPLAY:-}" \
+  XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-}" \
+  XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-}" \
+  DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
   HYPRLAND_INSTANCE_SIGNATURE="$SIG" \
   NX_PIN_WAIT=1 \
+  NX_CAPTURE="${NX_CAPTURE:-auto}" \
+  NX_STATE_DIR="${NX_STATE_DIR:-$HOME/.local/state/nx-rust}" \
   NX_BITRATE_KBPS="${NX_BITRATE_KBPS:-16000}" \
-  NX_ENCODER="${NX_ENCODER:-vaapi}" \
+  NX_ENCODER="${NX_ENCODER:-$DEF_ENCODER}" \
+  NX_FFMPEG_ENCODER="${NX_FFMPEG_ENCODER:-auto}" \
+  NX_VAAPI_DEVICE="${NX_VAAPI_DEVICE:-/dev/dri/renderD128}" \
   NX_AUDIO_DELAY_MS="${NX_AUDIO_DELAY_MS:-80}" \
   NX_AUDIO_BITRATE_KBPS="${NX_AUDIO_BITRATE_KBPS:-300}" \
-  NX_AUDIO_SOURCE="${NX_AUDIO_SOURCE:-nx_stream.monitor}" \
+  NX_AUDIO_SOURCE="$NX_AUDIO_SOURCE" \
   "$SERVER_DIR/target/release/nx-server" serve \
     --name "$SERVER_NAME" --pin "$SERVER_PIN" \
   >> "${NX_SERVER_LOG:-/tmp/nx-server.log}" 2>&1 < /dev/null

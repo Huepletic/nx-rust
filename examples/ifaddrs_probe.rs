@@ -1,9 +1,9 @@
 //! Пробник: что реально возвращает ifaddrs() и server_local_ip() для адреса клиента.
-//! Запуск: cargo run --release --example ifaddrs_probe -- 192.168.178.89
+//! Запуск: cargo run --release --example ifaddrs_probe -- 192.0.2.89
 fn main() {
     let client: std::net::IpAddr = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "192.168.178.89".into())
+        .unwrap_or_else(|| "192.0.2.89".into())
         .parse()
         .expect("IP");
 

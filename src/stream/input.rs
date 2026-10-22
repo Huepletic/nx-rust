@@ -208,6 +208,8 @@ pub struct InputInjector {
     cursor: (f64, f64),
     /// захватываемый вывод: (глобальное x, y, логический w, h)
     out: (f64, f64, f64, f64),
+    /// backend 'portal': геометрия уточняется после выбора монитора
+    portal_geometry: bool,
     held_mods: u8,
     unknown_keysyms: u64,
 }
@@ -286,6 +288,7 @@ impl InputInjector {
             left_held: false,
             cursor,
             out: (ox, oy, lw, lh),
+            portal_geometry: output == "portal",
             held_mods: 0,
             unknown_keysyms: 0,
         })
@@ -318,6 +321,24 @@ impl InputInjector {
     /// Если ABS-устройства нет — деградация в дельты REL (как раньше).
     fn abs_move(&mut self, fx: f64, fy: f64) {
         self.mode_abs = true;
+        // Портал: после диалога выбора монитора реальная геометрия становится
+        // известна — один раз уточняем out и bbox под выбранный экран.
+        if self.portal_geometry {
+            if let Some((x, y, w, h)) = crate::portal::geometry() {
+                let new_out = (x as f64, y as f64, w as f64, h as f64);
+                if self.out != new_out {
+                    println!(
+                        "input: портал выбрал монитор {}x{} @{},{} — уточняю маппинг ввода",
+                        w, h, x, y
+                    );
+                    self.out = new_out;
+                    // Пересчёт только здесь (подпроцессы дорогие), не на каждый кадр.
+                    if let Ok(b) = desktop_bbox() {
+                        self.bbox = b;
+                    }
+                }
+            }
+        }
         let (ox, oy, lw, lh) = self.out;
         let fx = fx.clamp(0.0, 1.0);
         let fy = fy.clamp(0.0, 1.0);
@@ -795,6 +816,24 @@ fn create_abs_device() -> Result<std::fs::File> {
 /// libinput мапит абсолютные оси. Проверено на Host: eDP-1 1600x900 + HEADLESS-4 1088x800
 /// + DP-2 1920x1080 → (0,0)..(6016,1700).
 fn desktop_bbox() -> Result<(f64, f64, f64, f64)> {
+    if let Ok(b) = hyprland_bbox() {
+        return Ok(b);
+    }
+    if let Ok(b) = kde_bbox() {
+        return Ok(b);
+    }
+    if let Ok(b) = x11_bbox() {
+        return Ok(b);
+    }
+    // Последний фоллбек: выбранный портал-монитор (один экран).
+    if let Some((x, y, w, h)) = crate::portal::geometry() {
+        return Ok((x as f64, y as f64, (x + w as i32) as f64, (y + h as i32) as f64));
+    }
+    let (w, h) = crate::probes::x11_screen_size()?;
+    Ok((0.0, 0.0, w as f64, h as f64))
+}
+
+fn hyprland_bbox() -> Result<(f64, f64, f64, f64)> {
     let v: serde_json::Value =
         serde_json::from_str(&hyprctl_json("monitors")?).context("парс monitors")?;
     let mons = v.as_array().context("hyprctl monitors: не массив")?;
@@ -819,6 +858,131 @@ fn desktop_bbox() -> Result<(f64, f64, f64, f64)> {
         anyhow::bail!("пустой bbox мониторов");
     }
     Ok((x0, y0, x1, y1))
+}
+
+/// KDE Plasma: kscreen-doctor -j отдаёт логическую раскладку мониторов.
+fn kde_bbox() -> Result<(f64, f64, f64, f64)> {
+    let out = std::process::Command::new("kscreen-doctor")
+        .arg("-j")
+        .output()
+        .context("запуск kscreen-doctor -j")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "kscreen-doctor -j: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let v: serde_json::Value = {
+        // kscreen-doctor может писать варнинги до JSON — режем от первой '{'.
+        let text = String::from_utf8_lossy(&out.stdout);
+        let json = &text[text.find('{').unwrap_or(0)..];
+        serde_json::from_str(json).context("парс kscreen-doctor -j")?
+    };
+    let outs = v["outputs"].as_array().context("kscreen-doctor: нет outputs")?;
+    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for o in outs {
+        if !o["enabled"].as_bool().unwrap_or(true) {
+            continue;
+        }
+        let g = &o["geometry"];
+        let x = g["x"].as_f64().unwrap_or(0.0);
+        let y = g["y"].as_f64().unwrap_or(0.0);
+        let w = g["width"].as_f64().unwrap_or(0.0);
+        let h = g["height"].as_f64().unwrap_or(0.0);
+        if w <= 0.0 || h <= 0.0 {
+            continue;
+        }
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x + w);
+        y1 = y1.max(y + h);
+    }
+    if !x0.is_finite() || x1 <= x0 || y1 <= y0 {
+        anyhow::bail!("kscreen-doctor: пустой bbox");
+    }
+    Ok((x0, y0, x1, y1))
+}
+
+/// X11: объединение мониторов из xrandr --query.
+fn x11_bbox() -> Result<(f64, f64, f64, f64)> {
+    let out = std::process::Command::new("xrandr")
+        .arg("--query")
+        .output()
+        .context("запуск xrandr --query")?;
+    if !out.status.success() {
+        anyhow::bail!("xrandr --query: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let txt = String::from_utf8_lossy(&out.stdout);
+    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for line in txt.lines() {
+        if !line.contains(" connected") {
+            continue;
+        }
+        for tok in line.split_whitespace() {
+            let Some((x, y, w, h)) = parse_x11_rect(tok) else {
+                continue;
+            };
+            x0 = x0.min(x as f64);
+            y0 = y0.min(y as f64);
+            x1 = x1.max((x + w as i32) as f64);
+            y1 = y1.max((y + h as i32) as f64);
+            break;
+        }
+    }
+    if !x0.is_finite() || x1 <= x0 || y1 <= y0 {
+        anyhow::bail!("xrandr: пустой bbox");
+    }
+    Ok((x0, y0, x1, y1))
+}
+
+pub fn parse_x11_rect(tok: &str) -> Option<(i32, i32, u32, u32)> {
+    let xpos = tok.find('x')?;
+    // `xrandr --listmonitors` печатает «W/ммxH/мм+X+Y»; `--query` — «WxH+X+Y».
+    let w: u32 = tok[..xpos]
+        .split('/')
+        .next()?
+        .trim_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .ok()?;
+    let rest = &tok[xpos + 1..];
+    let h_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let h: u32 = rest[..h_end]
+        .split('/')
+        .next()?
+        .parse()
+        .ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    // «…/мм» — физическая высота из --listmonitors, перед +X+Y её пропускаем.
+    let mut coords = &rest[h_end..];
+    if coords.starts_with('/') {
+        match coords.find(['+', '-']) {
+            Some(i) => coords = &coords[i..],
+            None => return None,
+        }
+    }
+    let (x, rest) = parse_signed_coord(coords)?;
+    let (y, _) = parse_signed_coord(rest)?;
+    Some((x, y, w, h))
+}
+
+fn parse_signed_coord(s: &str) -> Option<(i32, &str)> {
+    let sign = match s.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let rest = &s[1..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let v: i32 = rest[..end].parse().ok()?;
+    Some((sign * v, &rest[end..]))
 }
 
 /// Найти evdev-ноду нашего абсолютного устройства — нужна для самотеста кнопок
@@ -896,6 +1060,28 @@ fn hyprctl_json(sub: &str) -> Result<String> {
 
 /// Глобальное начало и логический размер захватываемого вывода.
 fn output_geometry(output: &str) -> Result<(f64, f64, f64, f64)> {
+    if output == "portal" {
+        // Портал открывается в pipeline::start (probe_output_size) перед
+        // первым кадром, но до выбора монитора в диалоге геометрии нет.
+        // Не блокируем control-поток: маппим на весь стол, а после выбора
+        // refresh_portal_geometry() уточнит область по факту.
+        if let Some((x, y, w, h)) = crate::portal::geometry() {
+            return Ok((x as f64, y as f64, w as f64, h as f64));
+        }
+        let (x0, y0, x1, y1) = desktop_bbox()?;
+        println!(
+            "input: portal-геометрия ещё не известна — fallback весь стол {}x{} @{},{}",
+            (x1 - x0) as u32,
+            (y1 - y0) as u32,
+            x0 as i32,
+            y0 as i32
+        );
+        return Ok((x0, y0, x1 - x0, y1 - y0));
+    }
+    if output == "x11" {
+        let (w, h) = crate::probes::x11_screen_size()?;
+        return Ok((0.0, 0.0, w as f64, h as f64));
+    }
     let v: serde_json::Value =
         serde_json::from_str(&hyprctl_json("monitors")?).context("парс monitors")?;
     let mons = v.as_array().context("hyprctl monitors: не массив")?;
