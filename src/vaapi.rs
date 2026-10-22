@@ -643,12 +643,32 @@ pub struct VaEncoder {
     recon: [u32; 2],
     /// Импортированные BGRX-поверхности обоих capture-слотов (источники VPP).
     srcs: [u32; 2],
-    /// NV12-поверхность VPP (стабильна на весь срок жизни).
-    vdst: u32,
+    /// NV12-поверхности VPP (ping-pong). Кадр N кодируется из vdst[N%2];
+    /// кадр N-1 ещё читает vdst[(N-1)%2] — одна общая поверхность заставляла
+    /// VPP ждать освобождения от энкодера (замер: p95 69 мс при p50 6.9).
+    vdst: [u32; 2],
     coded_size: u32,
     frame_idx: u32,
+    /// frame_num в битстриме (H.264 7.4.3): в IDR обязан быть 0, дальше
+    /// растёт на 1 до следующего IDR. Раньше писался глобальный счётчик
+    /// frame_idx (40, 80, …) → декодер отвергал все ключевые кадры после
+    /// первого и клиент вечно ждал "Waiting for IDR frame".
+    frame_num: u32,
+    /// Форсировать IDR на следующем кадре (запрос клиента control 0x0302).
+    pub force_idr: bool,
+    /// Coded-буферы на кадр (пул из 2: текущий + предыдущий в полёте).
+    /// Раньше vaCreateBuffer на 2.67 МБ создавался/уничтожался каждый кадр —
+    /// при 60 fps это 160 МБ/с аллокаций и страничных отказов.
+    coded: [u32; 2],
     /// Последний замер (vpp, setup, submit, sync) в мс — NX_VAAPI_TIMING.
     pub timing: (f64, f64, f64, f64),
+    /// Раздельные замеры ожидания: fence поверхности/буфера и чтения (map).
+    pub last_surf_ms: f64,
+    pub last_map_ms: f64,
+    /// Накопители для средних/максимумов за окно лога (сбрасываются отчётом).
+    tim_sum: (f64, f64, f64, f64),
+    tim_max: (f64, f64, f64, f64),
+    tim_n: u64,
     /// Кадр в полёте: (coded_buf, created_bufs). Sync/читается на СЛЕДУЮЩЕМ кадре.
     prev: Option<(u32, Vec<u32>)>,
 }
@@ -676,12 +696,13 @@ impl VaEncoder {
         let mbh = (oh + 15) / 16;
         let coded_size = (3 * ow * oh + 65536) as u32;
 
-        // NV12-поверхность VPP (выходного размера — VPP делает И конверсию, И
+        // NV12-поверхности VPP (выходного размера — VPP делает И конверсию, И
         // скейл за один проход: surface→dst разными размерами) + VPP-контекст.
-        let mut vdst = VA_INVALID_ID;
+        // Две поверхности: пока VCE читает vdst[N%2], VPP уже пишет vdst[(N+1)%2].
+        let mut vdst = [VA_INVALID_ID; 2];
         unsafe {
             va_ok(
-                vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, ow, oh, &mut vdst, 1, std::ptr::null(), 0),
+                vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, ow, oh, vdst.as_mut_ptr(), 2, std::ptr::null(), 0),
                 "vaCreateSurfaces(vpp dst)",
             )?;
         }
@@ -739,6 +760,25 @@ impl VaEncoder {
             )?;
         }
 
+        // Пул coded-буферов: текущий кадр + предыдущий в полёте.
+        let mut coded = [VA_INVALID_ID; 2];
+        for c in coded.iter_mut() {
+            unsafe {
+                va_ok(
+                    vaCreateBuffer(
+                        dpy,
+                        ectx,
+                        VABUFFER_TYPE_CODED,
+                        coded_size,
+                        1,
+                        std::ptr::null_mut(),
+                        c,
+                    ),
+                    "vaCreateBuffer(coded pool)",
+                )?;
+            }
+        }
+
         // Recon DPB: пинг-pong (текущая + предыдущая = референс).
         let mut recon = [VA_INVALID_ID; 2];
         unsafe {
@@ -767,9 +807,17 @@ impl VaEncoder {
             recon,
             srcs: [VA_INVALID_ID; 2],
             vdst,
+            coded,
             coded_size,
             frame_idx: 0,
+            frame_num: 0,
+            force_idr: false,
             timing: (0.0, 0.0, 0.0, 0.0),
+            last_surf_ms: 0.0,
+            last_map_ms: 0.0,
+            tim_sum: (0.0, 0.0, 0.0, 0.0),
+            tim_max: (0.0, 0.0, 0.0, 0.0),
+            tim_n: 0,
             prev: None,
         })
     }
@@ -904,10 +952,19 @@ impl VaEncoder {
     pub fn encode_slot(&mut self, slot: usize) -> Result<Vec<u8>> {
         let t_total = std::time::Instant::now();
         let i = self.frame_idx;
-        let idr = i % self.gop == 0;
+        // IDR — по GOP или по запросу клиента (control 0x0302).
+        let idr = self.force_idr || i % self.gop == 0;
+        self.force_idr = false;
+        // frame_num в битстриме: в IDR = 0, дальше +1 до следующего IDR
+        // (H.264 7.4.3). Глобальный счётчик i здесь ломал цепочку ссылок:
+        // после первого IDR декодер отвергал все ключевые кадры.
+        let fnum = if idr { 0 } else { self.frame_num.wrapping_add(1) };
+        self.frame_num = fnum;
 
-        // Источник → NV12 (vdst).
-        self.run_vpp(self.srcs[slot], self.vdst)?;
+        // Источник → NV12 (vdst). Поверхность чередуется по кадрам: кадр N-1
+        // ещё может кодироваться из своей vdst, пока VPP готовит следующую.
+        let vdst = self.vdst[(i % 2) as usize];
+        self.run_vpp(self.srcs[slot], vdst)?;
         let t_vpp = t_total.elapsed();
 
         let mut bids: Vec<u32> = Vec::with_capacity(12);
@@ -954,14 +1011,24 @@ impl VaEncoder {
             )?;
             bids.push(b);
             created.push(b);
+        }
 
+        // RC/HRD/FrameRate — на КАЖДЫЙ кадр, не только на IDR. Раньше они
+        // жили внутри `if idr`: при GOP=30 окно RC (500 мс = 30 кадров)
+        // сбрасывалось IDR'ом, а при длинном GOP после ~30 P-кадров VCE
+        // уходил в патологический режим (sync 170-250 мс/кадр). Замер:
+        // GOP=40 → p95 15 мс, GOP=240 → p50 84 мс.
+        {
             // misc RC
             let mut rcmem = [0u8; 4 + std::mem::size_of::<VaEncMiscParameterRateControl>()];
             rcmem[0..4].copy_from_slice(&(VA_ENC_MISC_TYPE_RATECONTROL as u32).to_le_bytes());
             let rc = unsafe { &mut *(&mut rcmem[4] as *mut u8 as *mut VaEncMiscParameterRateControl) };
             rc.bits_per_second = self.bitrate;
             rc.target_percentage = 100;
-            rc.window_size = 500;
+            rc.window_size = std::env::var("NX_RC_WINDOW")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(500);
             rc.initial_qp = 26;
             rc.min_qp = 10;
             rc.max_qp = 51;
@@ -989,31 +1056,16 @@ impl VaEncoder {
             created.push(b);
         }
 
-        // coded-буфер на кадр
-        let mut coded = VA_INVALID_ID;
-        unsafe {
-            va_ok(
-                vaCreateBuffer(
-                    self.va.dpy,
-                    self.ectx,
-                    VABUFFER_TYPE_CODED,
-                    self.coded_size,
-                    1,
-                    std::ptr::null_mut(),
-                    &mut coded,
-                ),
-                "vaCreateBuffer(coded)",
-            )?;
-        }
-        created.push(coded);
+        // coded-буфер из пула: 2 буфера, текущий + предыдущий в полёте.
+        let coded = self.coded[(i % 2) as usize];
 
         // picture
         let mut pic: VaEncPictureParameterBufferH264 = unsafe { std::mem::zeroed() };
         let cur = self.recon[(i % 2) as usize];
         pic.curr_pic.picture_id = cur;
-        pic.curr_pic.frame_idx = i;
-        pic.curr_pic.top_field_order_cnt = 2 * i as i32;
-        pic.curr_pic.bottom_field_order_cnt = 2 * i as i32;
+        pic.curr_pic.frame_idx = fnum;
+        pic.curr_pic.top_field_order_cnt = 2 * fnum as i32;
+        pic.curr_pic.bottom_field_order_cnt = 2 * fnum as i32;
         for k in 0..16 {
             pic.reference_frames[k].picture_id = VA_INVALID_ID;
             pic.reference_frames[k].flags = VA_PICTURE_H264_INVALID;
@@ -1021,13 +1073,13 @@ impl VaEncoder {
         if !idr {
             let prev = self.recon[((i + 1) % 2) as usize];
             pic.reference_frames[0].picture_id = prev;
-            pic.reference_frames[0].frame_idx = i - 1;
+            pic.reference_frames[0].frame_idx = fnum - 1;
             pic.reference_frames[0].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
-            pic.reference_frames[0].top_field_order_cnt = 2 * (i as i32 - 1);
-            pic.reference_frames[0].bottom_field_order_cnt = 2 * (i as i32 - 1);
+            pic.reference_frames[0].top_field_order_cnt = 2 * (fnum as i32 - 1);
+            pic.reference_frames[0].bottom_field_order_cnt = 2 * (fnum as i32 - 1);
         }
         pic.coded_buf = coded;
-        pic.frame_num = i as u16;
+        pic.frame_num = fnum as u16;
         pic.pic_init_qp = 26;
         // pic_fields: idr_pic_flag, reference_pic_flag, entropy_coding_mode(CABAC),
         // transform_8x8_mode(High).
@@ -1073,7 +1125,7 @@ impl VaEncoder {
 
         // packed SLICE (каждый кадр)
         {
-            let mut nal = build_slice_hdr(idr, i);
+            let mut nal = build_slice_hdr(idr, fnum);
             let mut ph: VaEncPackedHeaderParameterBuffer = unsafe { std::mem::zeroed() };
             ph.type_ = VA_ENC_PACKED_HEADER_SLICE_T;
             ph.bit_length = (nal.len() * 8) as u32;
@@ -1102,7 +1154,7 @@ impl VaEncoder {
         let mut slc: VaEncSliceParameterBufferH264 = unsafe { std::mem::zeroed() };
         slc.num_macroblocks = self.mbw * self.mbh;
         slc.slice_type = if idr { 2 } else { 0 }; // I=2, P=0
-        slc.pic_order_cnt_lsb = (2 * i) as u16;
+        slc.pic_order_cnt_lsb = (2 * fnum) as u16;
         slc.direct_spatial_mv_pred_flag = 1;
         for k in 0..32 {
             slc.ref_pic_list0[k].picture_id = VA_INVALID_ID;
@@ -1112,10 +1164,10 @@ impl VaEncoder {
         }
         if !idr {
             slc.ref_pic_list0[0].picture_id = self.recon[((i + 1) % 2) as usize];
-            slc.ref_pic_list0[0].frame_idx = i - 1;
+            slc.ref_pic_list0[0].frame_idx = fnum - 1;
             slc.ref_pic_list0[0].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
-            slc.ref_pic_list0[0].top_field_order_cnt = 2 * (i as i32 - 1);
-            slc.ref_pic_list0[0].bottom_field_order_cnt = 2 * (i as i32 - 1);
+            slc.ref_pic_list0[0].top_field_order_cnt = 2 * (fnum as i32 - 1);
+            slc.ref_pic_list0[0].bottom_field_order_cnt = 2 * (fnum as i32 - 1);
         }
         let b = mk(
             self.va.dpy,
@@ -1130,7 +1182,7 @@ impl VaEncoder {
         // кодирование
         let t_setup = t_total.elapsed() - t_vpp;
         unsafe {
-            va_ok(vaBeginPicture(self.va.dpy, self.ectx, self.vdst), "vaBeginPicture(enc)")?;
+            va_ok(vaBeginPicture(self.va.dpy, self.ectx, vdst), "vaBeginPicture(enc)")?;
             let r = vaRenderPicture(self.va.dpy, self.ectx, bids.as_mut_ptr(), bids.len() as u32);
             if r != VA_STATUS_SUCCESS {
                 self.cleanup(&created);
@@ -1146,13 +1198,18 @@ impl VaEncoder {
             // (его coded-буфер лежит в prev). VCE кодирует N, пока CPU
             // отдаёт N-1 в RTP — глубина конвейера 2 (как у ffmpeg async).
             let out = match self.prev.take() {
-                Some((prev_coded, mut prev_created)) => {
-                    prev_created.push(prev_coded);
+                Some((prev_coded, prev_created)) => {
                     let t0 = std::time::Instant::now();
                     let r = self.sync_read_coded(prev_coded);
                     let t_sync = t0.elapsed().as_secs_f64() * 1000.0;
+                    let t_clean = std::time::Instant::now();
                     self.cleanup(&prev_created);
+                    let clean_ms = t_clean.elapsed().as_secs_f64() * 1000.0;
+                    if clean_ms > 5.0 {
+                        println!("vaapi: cleanup {} буферов занял {:.1} мс", prev_created.len(), clean_ms);
+                    }
                     self.timing = (t_vpp.as_secs_f64()*1000.0, t_setup.as_secs_f64()*1000.0, t_submit.as_secs_f64()*1000.0, t_sync);
+                    self.acc_timing();
                     match r {
                         Ok(au) => au,
                         Err(e) => {
@@ -1162,31 +1219,76 @@ impl VaEncoder {
                     }
                 }
                 None => {
-                    // Первый кадр: ждать его (нечего отдавать).
-                    let t0 = std::time::Instant::now();
-                    if let Err(e) = va_ok(vaSyncBuffer(self.va.dpy, coded, 10_000_000_000), "vaSyncBuffer") {
-                        self.cleanup(&created);
-                        return Err(e);
-                    }
-                    let t_sync = t0.elapsed().as_secs_f64() * 1000.0;
-                    let au = self.read_coded(coded)?;
-                    self.cleanup(&created);
-                    self.timing = (t_vpp.as_secs_f64()*1000.0, t_setup.as_secs_f64()*1000.0, t_submit.as_secs_f64()*1000.0, t_sync);
+                    // Первый кадр: НЕ ждём его. Кладём в prev и возвращаем пустой
+                    // AU — кадр 0 уйдёт на следующем вызове, когда засабмичен
+                    // кадр 1. Иначе prev навсегда остаётся None и весь стрим
+                    // работает в глубину 1 (каждый кадр ждётся synс'ом).
+                    self.timing = (
+                        t_vpp.as_secs_f64() * 1000.0,
+                        t_setup.as_secs_f64() * 1000.0,
+                        t_submit.as_secs_f64() * 1000.0,
+                        0.0,
+                    );
+                    self.acc_timing();
+                    self.prev = Some((coded, created));
                     self.frame_idx += 1;
-                    return Ok(au);
+                    return Ok(Vec::new());
                 }
             };
 
             self.prev = Some((coded, created));
             self.frame_idx += 1;
+            if std::env::var_os("NX_ENC_TRACE").is_some() {
+                let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+                let (v, s, su, sy) = self.timing;
+                println!("trace enc[{i}] total={total_ms:.1} vpp={v:.1} setup={s:.1} submit={su:.1} sync={sy:.1} surf={:.1} map={:.1}", self.last_surf_ms, self.last_map_ms);
+            }
             Ok(out)
         }
     }
 
-    /// Sync + чтение coded-буфера в Annex-B AU.
+    /// Средние/максимумы стадий за окно лога; сбрасывает накопители.
+    pub fn report_timing(&mut self) -> ((f64, f64, f64, f64), (f64, f64, f64, f64), u64) {
+        let n = self.tim_n;
+        let k = n.max(1) as f64;
+        let avg = (
+            self.tim_sum.0 / k,
+            self.tim_sum.1 / k,
+            self.tim_sum.2 / k,
+            self.tim_sum.3 / k,
+        );
+        let max = self.tim_max;
+        self.tim_sum = (0.0, 0.0, 0.0, 0.0);
+        self.tim_max = (0.0, 0.0, 0.0, 0.0);
+        self.tim_n = 0;
+        (avg, max, n)
+    }
+
+    fn acc_timing(&mut self) {
+        let (a, b, c, d) = self.timing;
+        self.tim_sum.0 += a;
+        self.tim_sum.1 += b;
+        self.tim_sum.2 += c;
+        self.tim_sum.3 += d;
+        self.tim_max.0 = self.tim_max.0.max(a);
+        self.tim_max.1 = self.tim_max.1.max(b);
+        self.tim_max.2 = self.tim_max.2.max(c);
+        self.tim_max.3 = self.tim_max.3.max(d);
+        self.tim_n += 1;
+    }
+
+    /// Ждём готовности coded-буфера и читаем Annex-B AU.
+    /// ВАЖНО: ожидания 170-650 мс на кадр при GOP=120/240 — патология драйвера
+    /// VCE, а не vaSyncBuffer: при GOP=40 p95 sync ~10 мс, ffmpeg на том же
+    /// VCE кодирует 1088x800@60 со 107 fps. Не поднимать GOP выше 60.
     fn sync_read_coded(&mut self, coded: u32) -> Result<Vec<u8>> {
+        let t0 = std::time::Instant::now();
         unsafe { va_ok(vaSyncBuffer(self.va.dpy, coded, 10_000_000_000), "vaSyncBuffer")? };
-        self.read_coded(coded)
+        self.last_surf_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        let au = self.read_coded(coded)?;
+        self.last_map_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        Ok(au)
     }
 
     fn read_coded(&mut self, coded: u32) -> Result<Vec<u8>> {
@@ -1224,6 +1326,12 @@ impl Drop for VaEncoder {
         }
         let dpy = self.va.dpy;
         unsafe {
+            for c in self.coded {
+                if c != VA_INVALID_ID {
+                    vaDestroyBuffer(dpy, c);
+                }
+            }
+            vaDestroySurfaces(dpy, self.vdst.as_mut_ptr(), 2);
             vaDestroySurfaces(dpy, self.recon.as_mut_ptr(), 2);
             vaDestroyContext(dpy, self.ectx);
             vaDestroyContext(dpy, self.vctx);
@@ -1303,8 +1411,15 @@ fn fill_pattern(p: &mut [u8], pitch: u32, w: u32, h: u32, shift: i32) {
 pub fn selftest(nframes: usize) -> Result<()> {
     const W: u32 = 1088;
     const H: u32 = 800;
-    const GOP: u32 = 30;
-    const BITRATE: u32 = 20_000_000;
+    let gop: u32 = std::env::var("NX_GOP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let bitrate: u32 = std::env::var("NX_BITRATE_KBPS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|k| k * 1000)
+        .unwrap_or(20_000_000);
 
     let mut card = -1;
     for c in ["/dev/dri/card0", "/dev/dri/card1", "/dev/dri/card2", "/dev/dri/card3"] {
@@ -1316,39 +1431,65 @@ pub fn selftest(nframes: usize) -> Result<()> {
     }
     anyhow::ensure!(card >= 0, "не открыть /dev/dri/card*");
 
-    let mut dumb = DrmCreateDumb { height: H, width: W, bpp: 32, flags: 0, handle: 0, pitch: 0, size: 0 };
-    anyhow::ensure!(ioctl(card, DRM_IOCTL_MODE_CREATE_DUMB, &mut dumb as *mut _ as *mut _) == 0, "CREATE_DUMB");
-    let mut ph = DrmPrimeHandle { handle: dumb.handle, flags: O_RDWR_CLOEXEC as u32, fd: -1, _reserved: 0 };
-    anyhow::ensure!(ioctl(card, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _ as *mut _) == 0, "PRIME_HANDLE_TO_FD");
-    let dmabuf = ph.fd;
-    let sz = dumb.pitch as usize * H as usize;
-    let map = unsafe {
-        libc::mmap(std::ptr::null_mut(), sz, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, dmabuf, 0)
-    };
-    anyhow::ensure!(map != libc::MAP_FAILED, "mmap dmabuf");
-    let map = unsafe { std::slice::from_raw_parts_mut(map as *mut u8, sz) };
-
-    let mut enc = VaEncoder::new(W, H, W, H, BITRATE, GOP, 60)?;
-    enc.import_slot(0, dmabuf, dumb.pitch)?;
+    let mut enc = VaEncoder::new(W, H, W, H, bitrate, gop, 60)?;
+    // Два dmabuf-слота, как в боевом capture_loop: пока VCE читает слот N,
+    // CPU заполняет слот N+1. Один слот в пробнике создавал гонку «запись в
+    // поверхность, которую ещё кодирует VCE» и завышал sync до сотен мс.
+    let mut fds = [0i32; 2];
+    let mut pitches = [0u32; 2];
+    let mut maps: Vec<&mut [u8]> = Vec::new();
+    for s in 0..2 {
+        let mut dumb = DrmCreateDumb { height: H, width: W, bpp: 32, flags: 0, handle: 0, pitch: 0, size: 0 };
+        anyhow::ensure!(ioctl(card, DRM_IOCTL_MODE_CREATE_DUMB, &mut dumb as *mut _ as *mut _) == 0, "CREATE_DUMB {s}");
+        let mut ph = DrmPrimeHandle { handle: dumb.handle, flags: O_RDWR_CLOEXEC as u32, fd: -1, _reserved: 0 };
+        anyhow::ensure!(ioctl(card, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _ as *mut _) == 0, "PRIME_HANDLE_TO_FD {s}");
+        let sz = dumb.pitch as usize * H as usize;
+        let map = unsafe {
+            libc::mmap(std::ptr::null_mut(), sz, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, ph.fd, 0)
+        };
+        anyhow::ensure!(map != libc::MAP_FAILED, "mmap dmabuf {s}");
+        fds[s] = ph.fd;
+        pitches[s] = dumb.pitch;
+        maps.push(unsafe { std::slice::from_raw_parts_mut(map as *mut u8, sz) });
+    }
+    enc.import_slot(0, fds[0], pitches[0])?;
+    enc.import_slot(1, fds[1], pitches[1])?;
 
     let mut out = std::fs::File::create("/tmp/p3_rs.h264").context("open /tmp/p3_rs.h264")?;
     use std::io::Write;
     let mut total = 0usize;
     let mut total_ms = 0f64;
     let mut aums: Vec<f64> = Vec::new();
+    let period = std::time::Duration::from_nanos(1_000_000_000 / 60);
+    let mut next = std::time::Instant::now();
     for i in 0..nframes {
-        fill_pattern(map, dumb.pitch, W, H, (i as i32) * 136);
+        let slot = i % 2;
+        fill_pattern(&mut maps[slot], pitches[slot], W, H, (i as i32) * 136);
         let t0 = std::time::Instant::now();
-        let au = enc.encode_slot(0)?;
+        let au = enc.encode_slot(slot)?;
         let dt = t0.elapsed().as_secs_f64() * 1000.0;
         total_ms += dt;
         aums.push(dt);
         total += au.len();
         if i < 6 || nframes <= 40 {
-            let idr = i % GOP as usize == 0;
+            let idr = i % gop as usize == 0;
             println!("frame {} {}: bytes={} encode={:.2} ms", i, if idr { "IDR" } else { "P  " }, au.len(), dt);
+        } else if dt >= 20.0 {
+            let (vpp, setup, submit, sync) = enc.timing;
+            println!("frame {} {}: bytes={} encode={:.2} ms (spike) vpp={:.1} setup={:.1} submit={:.1} sync={:.1}", i, if i % gop as usize == 0 { "IDR" } else { "P  " }, au.len(), dt, vpp, setup, submit, sync);
         }
         out.write_all(&au)?;
+
+        // Реалистичный темп: захват даёт кадры 60/с. Без паузы цикл
+        // засабмичивает сотни кадров/с, очередь VCE растёт и замер врёт:
+        // sync начинает ждать кадр, который ещё в очереди.
+        next += period;
+        let now = std::time::Instant::now();
+        if next > now {
+            std::thread::sleep(next - now);
+        } else {
+            next = now;
+        }
     }
     println!(
         "done: {} frames, {} bytes, avg {:.2} ms/frame ({:.0} fps)",

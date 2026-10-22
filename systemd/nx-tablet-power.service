@@ -1,0 +1,18 @@
+[Unit]
+Description=nx-tablet-power — питание планшета (гасит Moonlight в простое, следит за зарядом)
+After=network.target
+
+[Service]
+Type=simple
+# NX_SERVER_DIR и остальные настройки — в /etc/nx-rust/nx.env
+# (пример: config/nx.env.example). Модуль работает через adb и не требует
+# root на планшете; host-side root нужен только для чтения dmesg.
+EnvironmentFile=-/etc/nx-rust/nx.env
+ExecStart=/usr/bin/env python3 ${NX_SERVER_DIR}/scripts/tablet_power.py
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

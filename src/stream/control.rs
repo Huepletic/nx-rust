@@ -139,7 +139,13 @@ fn handle_pkt(st: &StreamState, addr: SocketAddr, channel: u8, data: &[u8], inpu
     match ty {
         0x0305 => println!("control: Start A (ch={}, payload {}B) от {}", channel, pay.len(), addr),
         0x0307 => println!("control: Start B (ch={}, payload {}B) от {}", channel, pay.len(), addr),
-        0x0302 => println!("control: IDR-request от {} — MVP: лог, короткий GOP самовосстанавливает", addr),
+        0x0302 => {
+            // Клиент потерял опорный кадр и просит ключевой. Форсируем IDR на
+            // следующем кадре — иначе клиент ждёт естественного IDR (GOP=40
+            // кадров ≈0.7 с) и картинка стоит.
+            st.force_idr.store(true, std::sync::atomic::Ordering::Relaxed);
+            println!("control: IDR-request от {} — форсирую ключевой кадр", addr);
+        }
         0x0109 => println!("control: termination от {}", addr),
         0x0200 => {} // periodic ping — молча
         0x0201 | 0x0204 => {} // loss/frame stats — молча

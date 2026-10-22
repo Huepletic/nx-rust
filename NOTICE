@@ -1,0 +1,55 @@
+nx-rust
+Copyright (C) 2026 nx-rust contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, version 3 of the License.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <https://www.gnu.org/licenses/>.
+
+--------------------------------------------------------------------------
+Third-party reference code
+--------------------------------------------------------------------------
+
+The directory docs/research/ contains source files copied verbatim from
+Sunshine (https://github.com/LizardByte/Sunshine), which is licensed under
+the GNU General Public License v3.0:
+
+  docs/research/nvhttp.cpp
+  docs/research/nvhttp.h
+  docs/research/rtsp.cpp
+  docs/research/stream.cpp
+  docs/research/stream.h
+  docs/research/input.cpp
+  docs/research/main.cpp
+  docs/research/crypto.cpp
+  docs/research/crypto.h
+  docs/research/video.cpp
+
+These files are kept only as a protocol reference ("spec by code"). They are
+not compiled into nx-server. Their copyright and license belong to the
+Sunshine contributors. See docs/research/README.md for details.
+
+The GameStream/NX protocol is implemented independently in Rust, based on the
+public protocol description and on observing Moonlight/Sunshine behavior.
+No NVIDIA proprietary source code is included.
+
+Moonlight, Sunshine, NVIDIA, AMD, Hyprland, PipeWire and other names are
+trademarks of their respective owners. This project is not affiliated with,
+endorsed by, or sponsored by any of them.
+
+--------------------------------------------------------------------------
+Utilities that touch device firmware
+--------------------------------------------------------------------------
+
+tools/patch_libui_gralloc.py and scripts/fix_gadget3.sh are optional,
+device-specific utilities. They modify files/configfs on an Android device
+and require root/Magisk on that device. They are not needed for streaming
+and are provided WITHOUT ANY WARRANTY. Use at your own risk; you are
+responsible for complying with the laws and warranties that apply to your
+device.

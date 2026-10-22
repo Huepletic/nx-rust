@@ -1,0 +1,21 @@
+[Unit]
+Description=nx-watchdog — самовосстановление USB-RNDIS канала и стрима
+After=network.target
+
+[Service]
+Type=simple
+# NX_SERVER_DIR и остальные настройки — в /etc/nx-rust/nx.env
+# (пример: config/nx.env.example). Юниту нужен root: USBDEVFS_RESET,
+# адреса интерфейсов и sudo -u пользователя сессии.
+EnvironmentFile=-/etc/nx-rust/nx.env
+ExecStart=/usr/bin/env python3 ${NX_SERVER_DIR}/watchdog.py
+# nx-server запускается через setsid и живёт отдельно. Без этого рестарт
+# watchdog'а убивает стрим (он в той же cgroup) — проверено 2026-10-22.
+KillMode=process
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -2,6 +2,9 @@
 name = "nx-server"
 version = "0.1.0"
 edition = "2021"
+description = "GameStream/NX server for Wayland: VA-API H.264, Opus FEC, headless tablet streaming"
+license = "GPL-3.0-only"
+readme = "README.md"
 
 [dependencies]
 wayland-client = "0.31"

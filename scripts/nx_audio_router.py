@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 
-STREAM_MONITOR = os.environ.get("NX_STREAM_MONITOR", "HEADLESS-4")
+STREAM_MONITOR_ENV = os.environ.get("NX_STREAM_MONITOR", "")
 NX_SINK = os.environ.get("NX_SINK", "nx_stream")
 RTP_PORT = "49002"
 EVENTS = (
@@ -57,11 +57,31 @@ def ensure_sink() -> None:
         log(f"sink {NX_SINK} создан")
 
 
+def stream_monitor() -> str:
+    """Имя стрим-монитора.
+
+    Фиксировать нельзя: hyprland при пересоздании headless-вывода даёт другое
+    имя (было HEADLESS-4, стало HEADLESS-1 — 2026-10-21), и роутер молча
+    переставал переносить звук в nx_stream (игра уходила в динамики хоста,
+    на планшет шла тишина). nx-server выбирает так же — первый существующий
+    HEADLESS-* (src/main.rs: «ищем первый существующий»).
+    """
+    if STREAM_MONITOR_ENV:
+        return STREAM_MONITOR_ENV
+    try:
+        mons = json.loads(sh("hyprctl", "monitors", "-j"))
+    except Exception:
+        return "HEADLESS-1"
+    headless = sorted(m["name"] for m in mons if m.get("name", "").startswith("HEADLESS-"))
+    return headless[0] if headless else "HEADLESS-1"
+
+
 def streamed_pids() -> set[int]:
     """PID окон, чьи воркспейсы висят на стрим-мониторе."""
+    mon = stream_monitor()
     try:
         ws_on_mon = {w["name"] for w in json.loads(sh("hyprctl", "workspaces", "-j"))
-                     if w["monitor"] == STREAM_MONITOR
+                     if w["monitor"] == mon
                      and not w["name"].startswith("special")}
         clients = json.loads(sh("hyprctl", "clients", "-j"))
     except Exception:
@@ -171,7 +191,8 @@ def event_socket() -> socket.socket | None:
     sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
     if not sig:
         return None
-    path = f"/run/user/1000/hypr/{sig}/.socket2.sock"
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    path = f"{runtime}/hypr/{sig}/.socket2.sock"
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         s.connect(path)
@@ -183,7 +204,7 @@ def event_socket() -> socket.socket | None:
 def main() -> None:
     ensure_sink()
     sock = event_socket()
-    log(f"старт: stream_monitor={STREAM_MONITOR} sink={NX_SINK} "
+    log(f"старт: stream_monitor={stream_monitor()} sink={NX_SINK} "
         f"events={'ok' if sock else 'нет (только опрос)'}")
     pending = False
     last = 0.0
@@ -201,6 +222,11 @@ def main() -> None:
                         pending = True
                 except socket.timeout:
                     pass
+            # Hyprland шлёт события непрерывным потоком (окна/фокус/рабочие
+            # пространства) — без паузы цикл крутится на 100% CPU (2026-10-21:
+            # роутер съедал 0.7 ядра, хост был в 86% загрузки). Пауза в 50 мс
+            # не влияет на маршрутизацию (опрос всё равно раз в POLL секунд).
+            time.sleep(0.05)
             now = time.time()
             if pending and now - last > DEBOUNCE:
                 apply()

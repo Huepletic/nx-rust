@@ -128,6 +128,11 @@ pub struct StreamState {
     /// 150 мс) — они тормозили приём, RELIABLE-канал копил ретрансмиссии,
     /// и ввод ощутимо отставал от пальца.
     pub input: Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>,
+    /// Клиент попросил IDR (control 0x0302) — следующий кадр должен быть
+    /// ключевым. Раньше запрос только логировался: клиент после потери пакета
+    /// ждал следующего естественного IDR (до GOP=40 кадров ≈0.7 с) и картинка
+    /// «замирала» — отсюда и «Waiting for IDR frame» в логе клиента.
+    pub force_idr: AtomicBool,
 }
 
 impl StreamState {
@@ -159,6 +164,7 @@ impl StreamState {
             output: output.to_string(),
             last_activity: Mutex::new(Instant::now()),
             input: Mutex::new(None),
+            force_idr: AtomicBool::new(false),
         }))
     }
 }

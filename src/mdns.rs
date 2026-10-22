@@ -212,6 +212,8 @@ fn build_response(questions: &[(String, u16, bool)], hostname: &str, port: u16, 
     let target = format!("{}.local", normalize(hostname));
 
     let mut answers: Vec<u8> = Vec::new();
+    let mut need_ptr = false;
+    let mut asked_host = false;
     for (name, qtype, _) in questions {
         let name = name.as_str();
         let qtype = *qtype;
@@ -224,11 +226,10 @@ fn build_response(questions: &[(String, u16, bool)], hostname: &str, port: u16, 
         let is_instance = name == normalize(&instance);
 
         if service || is_instance {
-            if qtype == T_PTR || qtype == T_ANY {
-                // PTR регистрируем только на имя сервиса — инстанс PTR не имеет.
-                if service {
-                    answers.extend(rr(&normalize(SVC_TYPE), T_PTR, &encode_name(&instance), 4500, false));
-                }
+            if service {
+                // PTR нужен на ЛЮБОЙ вопрос по имени сервиса: клиент (Moonlight)
+                // по SRV/TXT без PTR не связывает сервис с инстансом.
+                need_ptr = true;
             }
             if qtype == T_SRV || qtype == T_ANY {
                 answers.extend(rr(&instance, T_SRV, &srv_rdata(port, &target), 120, true));
@@ -236,12 +237,18 @@ fn build_response(questions: &[(String, u16, bool)], hostname: &str, port: u16, 
             if qtype == T_TXT || qtype == T_ANY {
                 answers.extend(rr(&instance, T_TXT, &txt_rdata(), 4500, true));
             }
-            if service && (qtype == T_A || qtype == T_ANY) {
-                answers.extend(rr(&target, T_A, &ip.octets(), 120, true));
-            }
         } else if name == target && (qtype == T_A || qtype == T_ANY) {
-            answers.extend(rr(&target, T_A, &ip.octets(), 120, true));
+            asked_host = true;
         }
+    }
+    if need_ptr {
+        answers.extend(rr(&normalize(SVC_TYPE), T_PTR, &encode_name(&instance), 4500, false));
+    }
+    // A-запись добавляется, когда ответ что-то содержит ИЛИ клиент спросил
+    // сам хост: без неё клиент, спросивший только SRV/TXT, не узнаёт адрес
+    // хоста и показывает PC как "Offline" (проверено 2026-10-20 22:27).
+    if need_ptr || !answers.is_empty() || asked_host {
+        answers.extend(rr(&target, T_A, &ip.octets(), 120, true));
     }
 
     if answers.is_empty() {

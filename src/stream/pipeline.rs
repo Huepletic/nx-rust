@@ -19,7 +19,7 @@ const FLAG_SOF: u8 = 0x4;
 const VSZ: usize = 32; // sizeof(video_packet_raw_t)
 const MAX_RTP_HEADER: usize = 16;
 const NV_OFF: usize = 16; // смещение NV_VIDEO_PACKET внутри слота
-const GOP: u32 = 30;
+const GOP: u32 = 40;
 
 /// Запуск конвейера на ANNOUNCE: ffmpeg + capture-поток + RTP-поток.
 pub fn start(st: &Arc<StreamState>, cfg: AnnounceConfig) -> Result<()> {
@@ -299,7 +299,19 @@ fn start_vaapi(
     // FrameRef-слот: (slot-индекс, w, h, stride); dmabuf-буферы слотов живут
     // в capture-потоке весь стрим — энкодер импортирует их по fd один раз.
     type SlotFrame = (usize, u32, u32, u32);
-    let ready: Arc<Mutex<Option<SlotFrame>>> = Arc::new(Mutex::new(None));
+    // ОЧЕРЕДЬ готовых кадров, а не один слот.
+    //
+    // Композитор отдаёт копии ПАЧКАМИ (все слоты, готовые к одному commit'у,
+    // приходят почти одновременно). При одиночном слоте энкодер брал только
+    // первый кадр пачки, остальные перезаписывались — «вытеснено» +11..+20/с,
+    // и на клиент уходило 29 fps вместо 40-47 (замер 2026-10-20 23:10).
+    //
+    // Очередь даёт энкодеру переварить всю пачку (по 4 мс на кадр), а политика
+    // «выбросить самый старый» не даёт копиться задержке: если очередь
+    // переполнилась, свежий кадр важнее старого.
+    const READY_MAX: usize = 4;
+    let ready: Arc<Mutex<std::collections::VecDeque<SlotFrame>>> =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // capture → ready-слот (только прокидка параметров, без пикселей)
@@ -311,8 +323,12 @@ fn start_vaapi(
             let FrameRef::Dma { slot, w, h, stride, .. } = fr else {
                 anyhow::bail!("vaapi: пришёл Bgra-кадр (dmabuf-путь не активировался)");
             };
-            let stale = ready_c.lock().unwrap().replace((slot, w, h, stride));
-            if stale.is_some() {
+            let mut q = ready_c.lock().unwrap();
+            q.push_back((slot, w, h, stride));
+            // Переполнение → выбрасываем САМЫЙ СТАРЫЙ (свежее важнее, задержка
+            // не копится).
+            while q.len() > READY_MAX {
+                q.pop_front();
                 dropped_c.fetch_add(1, Ordering::Relaxed);
             }
             Ok(())
@@ -328,7 +344,13 @@ fn start_vaapi(
     let ready_e = ready.clone();
     let stop_e = stop.clone();
     let drop_e = cap_done.clone();
+    let st_force = st.clone();
     let mut frames: u64 = 0;
+    let mut win_frames: u64 = 0;
+    let mut drop_prev: u64 = 0;
+    let mut work_sum: f64 = 0.0;
+    let mut work_max: f64 = 0.0;
+    let mut work_n: u64 = 0;
     let mut hb = Instant::now();
     std::thread::spawn(move || {
         // Энкодер лениво: dim'ы известны с первого кадра. Result — чтобы ошибка
@@ -337,12 +359,12 @@ fn start_vaapi(
         let mut inited = false;
         loop {
             if stop_e.load(Ordering::Relaxed) && drop_e.load(Ordering::Relaxed)
-                && ready_e.lock().unwrap().is_none()
+                && ready_e.lock().unwrap().is_empty()
             {
                 break;
             }
-            let Some((slot, w, h, stride)) = ready_e.lock().unwrap().take() else {
-                std::thread::sleep(Duration::from_millis(1));
+            let Some((slot, w, h, stride)) = ready_e.lock().unwrap().pop_front() else {
+                std::thread::sleep(Duration::from_micros(250));
                 continue;
             };
             // dumb-буферы слотов живут в capture-потоке; dmabuf fd стабилен.
@@ -361,8 +383,13 @@ fn start_vaapi(
                     }
                 }
             }
+            let t_work = Instant::now();
             let res: Result<()> = (|| {
                 let e = enc.as_mut().unwrap();
+                // Запрос IDR от клиента (control 0x0302) — следующий кадр ключевой.
+                if st_force.force_idr.swap(false, Ordering::Relaxed) {
+                    e.force_idr = true;
+                }
                 if !e.slot_ready(slot) {
                     let fd = probes::slot_dmabuf_fd(slot)
                         .with_context(|| format!("fd слота {slot}"))?;
@@ -373,25 +400,42 @@ fn start_vaapi(
                 pipe_wr.flush()?;
                 Ok(())
             })();
+            let work_ms = t_work.elapsed().as_secs_f64() * 1000.0;
             if let Err(er) = res {
                 println!("vaapi: encode стоп: {er:#}");
                 break;
             }
             frames += 1;
+            win_frames += 1;
+            work_sum += work_ms;
+            work_max = work_max.max(work_ms);
+            work_n += 1;
             if hb.elapsed().as_millis() >= 1000 {
                 let _ = std::fs::write("/tmp/nx-vaapi-alive", format!("{}\n", frames));
-                let (vpp, setup, submit, sync) = match enc.as_ref() {
-                    Ok(e) => e.timing,
-                    Err(_) => (0.0, 0.0, 0.0, 0.0),
+                let ((av, asu, asub, asy), (mv, _msu, msub, msy), en) = match enc.as_mut() {
+                    Ok(e) => e.report_timing(),
+                    Err(_) => ((0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), 0),
                 };
+                let dnow = dropped.load(Ordering::Relaxed);
                 println!(
-                    "writer: {:.1} fps в vaapi-энкодер (всего {}), вытеснено {} | мс/кадр: vpp {:.2} setup {:.2} submit {:.2} sync(GPU-кодир) {:.2}",
-                    frames as f64 / hb.elapsed().as_secs_f64(),
+                    "writer: {:.1} fps в vaapi-энкодер (всего {}), вытеснено {} (+{}) | ср. vpp {:.2} setup {:.2} submit {:.2} sync {:.2} | макс vpp {:.1} submit {:.1} sync {:.1} | работа ср {:.2} макс {:.1} мс (n={}, enc={})",
+                    win_frames as f64 / hb.elapsed().as_secs_f64(),
                     frames,
-                    dropped.load(Ordering::Relaxed),
-                    vpp, setup, submit, sync
+                    dnow,
+                    dnow - drop_prev,
+                    av, asu, asub, asy,
+                    mv, msub, msy,
+                    work_sum / work_n.max(1) as f64,
+                    work_max,
+                    work_n,
+                    en,
                 );
                 hb = Instant::now();
+                win_frames = 0;
+                drop_prev = dnow;
+                work_sum = 0.0;
+                work_max = 0.0;
+                work_n = 0;
             }
         }
         drop(pipe_wr); // EOF в пайп → rtp-поток завершится

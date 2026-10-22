@@ -2,3 +2,17 @@
 __pycache__/
 .jspace/
 *.log
+
+# локальная конфигурация и секреты
+.env
+.env.*
+!.env.example
+config/*.env
+!config/nx.env.example
+*.pem
+*.key
+*.db
+
+# артефакты сборки/запуска
+/run/
+*.pyc
