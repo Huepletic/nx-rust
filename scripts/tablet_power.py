@@ -341,6 +341,18 @@ def load_peak():
         pass
 
 
+def force_unlimited_charging():
+    """USB-порт ПК (VBUS есть, BC1.2 = STANDARD_HOST/SUSPEND) уводит MTK-
+    алгоритм в ветку usb_charger_current_suspend=0 мА → «chg1's aicr is set
+    to 0mA, turn off» → заряд выключен навсегда после safety-таймера.
+
+    usb_unlimited=1 переключает алгоритм на сетевую зарядку (2 А), заряд
+    реально идёт: CHG_EN=1, ICHG≈2 А, 1.1–1.5 А в батарею (замер 2026-10-23).
+    Ядро сбрасывает флаг только по plug_out — применяем каждый цикл."""
+    rc, out = adb("echo '1 0' > /proc/mtk_battery_cmd/current_cmd", timeout=15)
+    return rc == 0
+
+
 def cycle():
     global _last_cc, _last_cc_ts, _peak_discharge_ma, _peak_discharge_ts
     global _passive_ma
@@ -348,6 +360,14 @@ def cycle():
     if not st:
         log("планшет недоступен (adb) — пропускаю цикл")
         return
+    # Заряд от USB-порта ПК заблокирован алгоритмом MTK (см. выше) —
+    # раз в цикл поднимаем usb_unlimited, если adb root доступен.
+    if st.get("usb_online"):
+        if not force_unlimited_charging():
+            log("usb_unlimited: не применился (adb root недоступен?)")
+        else:
+            # цикл занимает до 30 с — перечитываем состояние после записи
+            st = tablet_state() or st
     cc_delta = None
     if st.get("charge_counter") is not None:
         if _last_cc is not None and st["charge_counter"] >= _last_cc:
