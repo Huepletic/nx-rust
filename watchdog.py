@@ -705,7 +705,13 @@ def reconnect_stream(max_tries=12):
             launch_limelight()
             time.sleep(3)
             continue
-        if "terminat" in low or "disconnect" in low:
+        # Диалог Connection Error у Moonlight после обрыва: заголовок
+        # «Connection Error», тело «Failed to start Desktop … 47984 47989»
+        # (2026-10-24). Ни "terminat", ни "disconnect" тут не встречаются,
+        # поэтому ветка пропускала диалог, ui_dump считал состояние
+        # «неизвестным» и reconnect зацикливался на launch_limelight.
+        if ("terminat" in low or "disconnect" in low
+                or "connection error" in low or "failed to" in low):
             pt = (find_center(xml, ["OK", "Ok", "CLOSE", "Close",
                                     "Закрыть", "Dismiss"])
                   or (1457, 896))
