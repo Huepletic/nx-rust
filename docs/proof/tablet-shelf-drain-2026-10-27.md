@@ -1,77 +1,75 @@
-# Планшет: разряд на полке (P1) — 2026-10-27
+# Разряд планшета на полке: 11%/день при выключенном экране
+
+Дата: 2026-10-27. Планшет Ri0T1100PK0008473, Treble GSI Android 11 (userdebug),
+MT8788 (mt6771), ядро 4.14.186, Magisk 29.
 
 ## Симптом
 
 Планшет, оставленный НЕподключённым на полке неделю, разрядился в ноль.
-Средний фоновый расход: **~34 мА** (7450 мАч / 65.4 ч из batterystats),
-экран ни разу не включался.
+Batterystats (2d17h, снято в `bs.txt`): 7450 мАч (100%) сгорело на «idle» —
+**34 мА среднего фонового расхода**. Экран off 100% времени, WiFi off,
+BT off, сотовый вне сети, wakelock'и приложений — 11 мин за 65 ч.
+Радио и приложения НЕ виноваты.
 
-## Диагноз (данные, не догадки)
+## Корень (доказательства)
 
-Снято с планшета в день инцидента:
+1. **Uptime == realtime на батарее 65.4 ч** → ядро ни разу не ушло в suspend
+   за всё время на полке. `/sys/power/suspend_stats/success = 0`.
+   dmesg каждые ~5 с: `Power/swap DP: No enter --- SODI3: No enter --- SODI: No enter`,
+   `mtk_charger_alarm_timer_func: not suspend, wake up charger` каждые 10 с.
+2. **CPU governor = performance на всех 8 ядрах** — ставил наш же Magisk-модуль
+   `cpu_perf` (v2) на каждой загрузке. Ядра не даунклочатся, idle-потребление
+   SoC максимальное.
+3. **getgameserver** (vendor MTK, `/vendor/bin/getgameserver`, capabilities
+   NET_ADMIN/NET_RAW) держит AF_PACKET-сокет (`tpacket_rcv` на ALL, `/proc/net/packet`)
+   и гоняет `eth_work` по каждому пакету RNDIS-линка. ftrace (workqueue_execute_start,
+   3 с окно): **208 001 вызовов eth_work**, kworkers (`kworker/1:0`, `/0:0`, `/3:1`,
+   `/2:2`) по 100% CPU, loadavg 31. `strace` dnsmasq (tethering): accept4-спин
+   10420 EINVAL/с, 3917 pselect6/с — второй фоновой житель CPU.
+4. **phh Treble Doze** (handwave/pocket) держал PROXIMITY-сенсор активным на
+   экране-off (`me.phh.treble.app.Doze,proximity @1000ms`).
 
-- `dumpsys batterystats --charged`: Time on battery 2д 17ч 14м, screen on 0%.
-  Все userspace wakelock'и суммарно **11 мин 5 с** за 65 ч — apps ни при чём.
-- `Total partial wakelock time: 11m 4s`; главный держатель — uid 1000 (system),
-  мелочь. Приложения (включая com.limelight) — доли процента.
-- WiFi выключен (`wifi_on=0`), Bluetooth выключен, SIM нет, сотовый в OOS 100%
-  (`Cellular kernel active time: 0ms`).
-- **Ядро ни разу не заснуло**: `/sys/power/suspend_stats/success = 0` за всё время.
-- SPM (MTK System Power Manager) каждые 5 с пишет:
-  `Power/swap DP: No enter --- SODI3: No enter --- SODI: No enter` —
-  ни deep idle, ни SODI не достигаются.
-- `mtk_charger_alarm_timer_func: not suspend, wake up charger` — зарядный
-  alarm будит систему каждые ~10 с.
-- **CPU governors = performance** на обоих кластерах (2.1/2.0 ГГц) при
-  выключенном экране: vendor.mtkpower@1.0-service не отдаёт перформанс-моду
-  после завершения стрима.
-- kworker'ы в сумме >100% CPU; найден и убит спин `dnsmasq` tethering'а:
-  **accept4-спин 100% CPU** (34613 failed accept4 за 4 с; 31 мин CPU).
-- Doze-сенсоры Treble GSI (me.phh.treble.app Doze) слушали accelerometer
-  125 Гц даже с выключенным экраном → отключено (key_doze_handwave/pocket=false
-  в /data/data/me.phh.treble.app/shared_prefs/).
+## Почему suspend не наступал — проверка вручную
 
-Итог: планшет никогда не спит + CPU на максимальной частоте = 34 мА.
+`echo mem > /sys/power/state` (root): попытки ЕСТЬ, но `fail` растёт,
+`last_failed_step = suspend_noirq`, активные wakeup-источники в момент отказа:
+`musb-hdrc` (USB-гаджет), `NETLINK` (rtnl-сокеты dnsmasq/getgameserver),
+`pri_disp_wakelock` (экран). Т.е. **framework suspend-путь живой**; пока кабель
+в порту — musb-hdrc легально держит систему. На полке (кабель вынут) остаются
+NETLINK-держатели — их убирает демон (ниже).
 
-## Fix
+## Исправление (host-независимое, живёт на планшете)
 
-### nx-shelf-daemon.sh (на планшете, `05767d9`)
+Magisk-модуль `cpu_perf` v3 (`/data/adb/modules/cpu_perf/service.sh`,
+бэкап v2 рядом: `service.sh.v2.bak`). После каждой загрузки:
 
-Root-демон в `/data/local/tmp/nx-shelf-daemon.sh` (репо: `tablet/`):
+- `stop getgameserver` — init не рестартит остановленный; eth_work-шторм гаснет.
+- Демон-полка (цикл 20 с):
+  - USB подключён ИЛИ жив `com.limelight` → governor `performance` (стриму нужен);
+  - иначе (полка) → governor `schedutil` (ядра даунклочатся) + `dnsmasq` под нож
+    (tethering без хоста не нужен, netd сам перезапустит при USB).
+- Прочие твики стрима без изменений: 8 ядер online, thermal-триппоинты подняты,
+  deadline I/O, VM/net sysctl, density 320.
 
-- Каждые 15 с проверяет `/sys/class/power_supply/usb/online`.
-- USB пропал >90 с → `schedutil` на policy0/policy4 + kill dnsmasq.
-- USB вернулся → `performance` обратно (стриму нужны частоты).
-- Лог: `/data/local/tmp/nx-shelf-daemon.log`.
+Заменён временный `/data/local/tmp/nx-shelf-daemon.sh` (переименован в
+`.disabled`) — два демона дрались бы за governor.
 
-Запуск (adbd уже root на userdebug):
+phh Doze-сенсоры (handwave/pocket) выключены в
+`/data/data/me.phh.treble.app/shared_prefs/me.phh.treble.app_preferences.xml`
+(force-stop TrebleApp; proximity-соединение из sensorservice пропало).
 
-```bash
-adb push tablet/nx-shelf-daemon.sh /data/local/tmp/
-adb shell chmod +x /data/local/tmp/nx-shelf-daemon.sh
-adb shell 'toybox setsid -d /data/local/tmp/nx-shelf-daemon.sh </dev/null >/dev/null 2>&1'
-```
+## Проверка после ремонта (USB подключён, Limelight жив)
 
-Внимание: процесс виден в `ps` как `sh` с ppid 1, не как «nx-shelf-daemon».
-Живость проверять по свежей метке в лог-файле.
+- CPU по `/proc/stat` за 4 с: ~26% одного ядра (было: kworkers 4×100%, sys 155%).
+- eth_work в чистом 3-с ftrace-окне: шторм ушёл вместе с getgameserver.
+- governor: performance (корректно: стрим/экран активны).
+- `getgameserver`: `init.svc = stopped`, процесса нет.
 
-### Что демон НЕ решает
+## Что осталось проверить (нужен пользователь / отсоединение кабеля)
 
-Главный расход — **отсутствие suspend** (success=0, SPM «No enter»).
-schedutil снизит частоту, но полностью проблему «полки» не закроет: даже
-на низкой частоте SoC без suspend ест заметно больше, чем должен. Оценка
-после демона: ~34 мА → ~12–20 мА (месяц вместо недели). Полный fix требует
-разбора, почему PM не уходит в suspend (подозреваемые: USB-гаджет в
-configured state, mtk_charger alarm, thermal polling `mt-i2c` IRQ,
-`stk3x3x` ALS/PS poll). Это следующий шаг, если неделя на schedutil не устроят.
-
-## Попутно найдено и починено
-
-- Watchdog ребутал планшет на заряде 1% в момент, когда юзер включал
-  USB tethering (`222d0c1`): gates в `reboot_tablet()` — пауза 8 с,
-  boot_completed, экран горит → не ребутаем, заряд <10% → не ребутаем.
-- «Failed to start Desktop (error 400)» после серии ребутов — nx-server
-  залип в старой RTSP-сессии и отвечал на `/resume` честным
-  «resume not yet implemented» (`src/nvhttp/mod.rs:490`). Лечение —
-  рестарт nx-server через `launch_nx.sh` (без pkill). Кандидат на future
-  fix: реализовать `/resume` (переподнять pipeline) или `/quit` сброс.
+1. Отсоединить USB при ≥30% заряда → подождать 90 c (демон: schedutil +
+   kill dnsmasq) → оставить на 2–3 ч → проверить процент за час и
+   `suspend_stats/success > 0` при следующем подключении.
+2. Если успех не растёт — смотреть `dmesg | grep suspend_noirq` и активные
+   wakeup-источники (`/proc/wakeup_sources` недоступен на этом ядре;
+   брать из dmesg-строк `active wakeup source:`).
