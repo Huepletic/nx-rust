@@ -92,6 +92,13 @@ SOFT_REPAIR_COOLDOWN = 60    # не чаще раза в минуту: мягк�
                             # журнал и нагружает хост (был шторм sudo ip addr
                             # раз в секунду — 2026-10-20 22:09)
 _last_soft_repair = 0.0
+REBOOT_MIN_BATTERY = 10      # %: ниже не ребутаем (2026-10-27: ребут при 1% на
+                            # глубоком разряде может вообще не подняться)
+REBOOT_SETTLE = 8            # с: пауза «дать осеться» перед ребутом планшета,
+                            # юзер мог сам щёлкать настройки USB (tethering)
+REBOOT_AWAKE_MAX_BLOCKS = 3  # сколько циклов подряд экран горит, прежде чем
+                            # всё-таки ребутнуть (залипший диалог, юзера нет)
+_reboot_awake_blocks = 0
 RECONNECT_COOLDOWN = 120     # не чаще раза в 2 мин: переподключение стрима
                             # поднимает Limelight на планшете, а при погашенном
                             # экране вообще упирается в бесконечный цикл
@@ -488,9 +495,39 @@ def reboot_tablet():
     больше нет. adb живёт на отдельной USB-функции (ff/42/01) и работает
     даже при мёртвом RNDIS-канале — значит ребут планшета возможен, когда
     данные уже не идут."""
+    global _reboot_awake_blocks
+    # 2026-10-27 17:31: юзер включал USB tethering на планшете — гаджет
+    # легитимно рвёт adb на 5-10 с, наш configfs-ремонт влез в его действия
+    # и спустя 4 с «неудачи» ребутнул ПЛАНШЕТ при заряде 1%. Перед
+    # необратимым шагом: пауза + проверка, кто и что перед нами.
+    time.sleep(REBOOT_SETTLE)
     if not adb_alive():
         log("  adb недоступен — ребут планшета невозможен (нужен физический "
             "кабель или ребут хоста)")
+        return False
+    rc, out = adb("getprop sys.boot_completed", timeout=15)
+    if out.strip() != "1":
+        log("  не ребутаю: планшет ещё не загрузился (boot_completed=%r)"
+            % out.strip())
+        return False
+    rc, out = adb("dumpsys power | grep -m1 mWakefulness=", timeout=20)
+    if "mWakefulness=Awake" in out:
+        _reboot_awake_blocks += 1
+        if _reboot_awake_blocks <= REBOOT_AWAKE_MAX_BLOCKS:
+            log("  не ребутаю: экран планшета горит — юзер щёлкает настройки "
+                "сам; пропускаю цикл")
+            return False
+        log("  экран горит дольше %d циклов без юзера — похоже на залипший "
+            "диалог, ребутаю" % REBOOT_AWAKE_MAX_BLOCKS)
+    else:
+        _reboot_awake_blocks = 0
+    rc, out = adb("dumpsys battery", timeout=20)
+    m = re.search(r"level:\s*(\d+)", out)
+    level = int(m.group(1)) if m else 0
+    if level < REBOOT_MIN_BATTERY:
+        log("  не ребутаю: заряд %d%% <%d%% — при глубоком разряде ребут "
+            "может не подняться. Жду заряда (кабель в зарядке)." %
+            (level, REBOOT_MIN_BATTERY))
         return False
     log("  перезагружаю ПЛАНШЕТ (пользовательский рецепт: чинит USB-канал)")
     adb("svc power reboot", timeout=20)
