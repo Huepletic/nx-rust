@@ -53,6 +53,27 @@ elif [ -z "${WAYLAND_DISPLAY:-}" ]; then
     fi
   done
 fi
+# Сокет композитора создаётся через пару секунд после его старта: автостарт
+# на логине поднимает nx-server РАНЬШЕ Hyprland (13:26:22 против 13:26:24,
+# 2026-10-28), сокета wayland-1 ещё нет — и раньше скрипт молча unset'ил
+# WAYLAND_DISPLAY: сервер работал слепым и ВСЕ стримы падали на
+# probe_output_size до ручного рестарта. Ждём появления сокета до 90 с
+# (только если это не X11-сессия: на X11 wayland-сокета не будет никогда).
+if { [ -z "${WAYLAND_DISPLAY:-}" ] || [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; } \
+   && [ -z "${DISPLAY:-}" ] && [ "${XDG_SESSION_TYPE:-}" != "x11" ]; then
+  echo "launch_nx: жду сокет wayland (до 90 с)" >&2
+  _i=0
+  while [ "$_i" -lt 45 ]; do
+    _s=$(ls "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\.lock$' | head -1)
+    if [ -n "$_s" ]; then
+      WAYLAND_DISPLAY="${_s##*/}"
+      break
+    fi
+    _i=$((_i+1))
+    sleep 2
+  done
+  unset _i _s
+fi
 if [ -n "${WAYLAND_DISPLAY:-}" ] && { [ -S "$WAYLAND_DISPLAY" ] || [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; }; then
   export WAYLAND_DISPLAY
 else

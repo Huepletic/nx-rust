@@ -17,7 +17,10 @@ pub fn start(st: Arc<StreamState>) -> Result<()> {
                     let st = st.clone();
                     std::thread::spawn(move || {
                         if let Err(e) = handle_conn(sock, addr, &st) {
-                            println!("rtsp[{}]: {}", addr, e);
+                            // {:#} — печатаем всю цепочку anyhow, иначе
+                            // «probe_output_size» скрывает корень
+                            // («нет WAYLAND_DISPLAY»), см. 2026-10-28.
+                            println!("rtsp[{}]: {:#}", addr, e);
                         }
                     });
                 }
