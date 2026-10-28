@@ -70,6 +70,10 @@ HOST_IP = os.environ.get("NX_HOST_IP", "192.168.8.1")      # адрес хост
                             # его же Moonlight-клиент хранит в своей БД — менять нельзя
 TABLET_IP = os.environ.get("NX_TABLET_IP", "192.168.8.89") # rndis0 на планшете
 SUBNET = os.environ.get("NX_TABLET_SUBNET", "192.168.8.0/24")
+# adb должен ходить ТОЛЬКО к планшету: в сети может быть чужое устройство
+# (личный телефон с adb over TCP) — без -s все команды падают в
+# "more than one device/emulator" (инцидент 2026-10-28).
+TABLET_SERIAL = os.environ.get("NX_TABLET_SERIAL", "Ri0T1100PK0008473")
 USB_VENDOR = os.environ.get("NX_USB_VENDOR", "0e8d")       # MediaTek RNDIS-гаджет
 # quickshell — личный шелл автора; в чужом окружении его нет. Пусто = не трогать.
 QUICKSHELL_UNIT = os.environ.get("NX_QUICKSHELL_UNIT", "")
@@ -132,8 +136,8 @@ def sh(cmd, timeout=20):
 
 
 def adb(cmd, timeout=20):
-    """adb shell. Возвращает (rc, output)."""
-    return sh('adb shell "%s"' % cmd, timeout=timeout)
+    """adb shell к конкретному планшету. Возвращает (rc, output)."""
+    return sh('adb -s %s shell "%s"' % (TABLET_SERIAL, cmd), timeout=timeout)
 
 
 # ---------- диагностика ----------
@@ -323,9 +327,10 @@ def mdns_membership_ok():
 
 
 def adb_alive():
-    """Есть ли РЕАЛЬНО подключённое устройство. Нельзя проверять подстроку
+    """Есть ли РЕАЛЬНО подключённый НАШ планшет. Нельзя проверять подстроку
     'device' — заголовок пустого вывода 'List of devices attached' её содержит
-    (ловушка, из-за которой wait_adb_back не запускал kill-server)."""
+    (ловушка, из-за которой wait_adb_back не запускал kill-server). Чужие
+    устройства в списке (adb over TCP) не считаются."""
     rc, out = sh("adb devices")
     if rc != 0:
         return False
@@ -335,7 +340,8 @@ def adb_alive():
                 or line.startswith("* daemon")):
             continue
         # строка устройства: "<serial>\tdevice" (либо offline/unauthorized)
-        if line.split()[-1] == "device":
+        parts = line.split()
+        if parts[-1] == "device" and parts[0] == TABLET_SERIAL:
             return True
     return False
 
@@ -442,7 +448,8 @@ def usb_reset():
 
 def adb_root(cmd, timeout=30):
     """adb shell от root'а на планшете (su)."""
-    return sh('adb shell "su -c \'%s\'"' % cmd.replace('"', '\\"'), timeout=timeout)
+    return sh('adb -s %s shell "su -c \'%s\'"'
+              % (TABLET_SERIAL, cmd.replace('"', '\\"')), timeout=timeout)
 
 
 def tablet_gadget_fix():
@@ -459,7 +466,8 @@ def tablet_gadget_fix():
         if not os.path.exists(src):
             log("  нет скрипта починки гаджета (%s) — RNDIS не поднимется" % src)
             return False
-        sh('adb push "%s" %s' % (src, script), timeout=60)
+        sh('adb -s %s push "%s" %s' % (TABLET_SERIAL, src, script),
+           timeout=60)
     log("  чиню configfs гаджета на планшете (rndis.gs4 + ffs.adb)")
     adb_root("sh %s" % script, timeout=60)
     time.sleep(6)

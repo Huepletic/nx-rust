@@ -303,6 +303,7 @@ x11grab.
 | `NX_PIN_WAIT` | — | `0` — не ждать PIN при pairing |
 | `NX_HOST_IP` / `NX_TABLET_IP` | `192.168.8.1` / `.89` | RNDIS-адреса |
 | `NX_TABLET_SUBNET` | `192.168.8.0/24` | RNDIS-подсеть |
+| `NX_TABLET_SERIAL` | серийник планшета | привязка adb watchdog к своему устройству |
 | `NX_USER` / `NX_UID` | владелец репозитория | от кого запускать Wayland/PipeWire |
 | `NX_QUICKSHELL_UNIT` | пусто | личный quickshell автора; в чужом окружении не задавать |
 
