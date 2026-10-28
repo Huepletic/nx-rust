@@ -40,14 +40,16 @@ NETLINK-держатели — их убирает демон (ниже).
 
 ## Исправление (host-независимое, живёт на планшете)
 
-Magisk-модуль `cpu_perf` v3 (`/data/adb/modules/cpu_perf/service.sh`,
-бэкап v2 рядом: `service.sh.v2.bak`). После каждой загрузки:
+Magisk-модуль `cpu_perf` v3c (`/data/adb/modules/cpu_perf/service.sh`,
+бэкапы рядом: `service.sh.v2.bak`, `service.sh.v3b.bak`). После каждой загрузки:
 
 - `stop getgameserver` — init не рестартит остановленный; eth_work-шторм гаснет.
 - Демон-полка (цикл 20 с):
   - USB подключён ИЛИ жив `com.limelight` → governor `performance` (стриму нужен);
-  - иначе (полка) → governor `schedutil` (ядра даунклочатся) + `dnsmasq` под нож
-    (tethering без хоста не нужен, netd сам перезапустит при USB).
+  - иначе (полка) → governor `schedutil` (ядра даунклочатся);
+  - USB в порту, а `rndis0` не в `TetheredState` → «тик» USB-конфига
+    (`sys.usb.config`: adb → rndis,adb, не чаще раза в 5 мин) — фреймворк
+    сам перезапускает tethering + dnsmasq (см. «Переподключение USB» ниже).
 - Прочие твики стрима без изменений: 8 ядер online, thermal-триппоинты подняты,
   deadline I/O, VM/net sysctl, density 320.
 
@@ -65,11 +67,49 @@ phh Doze-сенсоры (handwave/pocket) выключены в
 - governor: performance (корректно: стрим/экран активны).
 - `getgameserver`: `init.svc = stopped`, процесса нет.
 
+## Переподключение USB без хоста (2026-10-28)
+
+Проблема: после выдёргивания кабеля Android **сам снимает USB-tethering**
+(framework → `rndis0 - AvailableState`, dnsmasq умирает), а при втыкании
+обратно НЕ возвращает его (это штатное поведение Android). Итог: хост не
+видит сетевую карту, «планшет не может подключиться к ПК», восстановление —
+только руками (включить USB-tethering в настройках / дефолт USB-конфигурации
+в «Для разработчиков»).
+
+Промежуточный костыль (статика 192.168.8.1/89 на обеих сторонах) оказался
+НЕРАБОЧИМ при живом фреймворке: tethering навешивает на rndis0 свои
+fwmark/BPF-правила маршрутизации, и всё вне его DHCP-подсети получает
+«Network is unreachable» (проверено: `ping 192.168.8.1` из планшета при
+TetheredState = unreachable, хотя адреса на интерфейсе есть).
+
+Решение (без хардкодов):
+
+- **rndis0 полностью владеет tethering-фреймворк**: адрес планшета и dnsmasq
+  (DHCP-сервер) — его, подсеть динамическая (сейчас 192.168.174.0/24).
+- **Хост**: NM-профиль `usb-rndis`, `ipv4.method auto` (DHCP-клиент),
+  `ipv4.never-default yes` (не крадёт маршрут по умолчанию),
+  `ipv4.ignore-auto-dns yes` (DNS планшета без upstreamа мёртв), привязка
+  `match.interface-name enp0s16u3` (NM 1.58, glob/match.mac не умеет).
+  Интерфейс возвращён под управление NM: убрана строка
+  `interface-name:enp0s16u3` из
+  `/etc/NetworkManager/conf.d/99-unmanaged-usb-rndis.conf`.
+- **Планшет**: демон `cpu_perf` v3c каждые 20 с проверяет: USB в порту
+  (`/sys/class/power_supply/usb/online`), а `rndis0` НЕ в `TetheredState` →
+  «тик» USB-конфига `sys.usb.config`: adb → rndis,adb (не чаще раза в 5 мин).
+  Это автоматизирует ручное «включить USB-tethering»: смена USB-функции
+  заставляет фреймворк перезапустить tethering и dnsmasq. На зарядке без
+  хоста тик безвреден (гаджет не перечисляется без хоста).
+- На планшете в «Для разработчикках» установлено: USB-конфигурация по
+  умолчанию = rndis (persist, переживает ребут).
+
 ## Что осталось проверить (нужен пользователь / отсоединение кабеля)
 
-1. Отсоединить USB при ≥30% заряда → подождать 90 c (демон: schedutil +
-   kill dnsmasq) → оставить на 2–3 ч → проверить процент за час и
-   `suspend_stats/success > 0` при следующем подключении.
-2. Если успех не растёт — смотреть `dmesg | grep suspend_noirq` и активные
+1. Отсоединить USB при ≥30% заряда → подождать 90 c (демон: schedutil) →
+   оставить на 2–3 ч → проверить процент за час и `suspend_stats/success > 0`
+   при следующем подключении.
+2. Проверить полный цикл переподключения: выдернуть кабель → втыкнуть →
+   в течение ~1 мин NM должен получить DHCP-адрес и пинг до планшета должен
+   восстановиться БЕЗ ручных действий.
+3. Если успех не растёт — смотреть `dmesg | grep suspend_noirq` и активные
    wakeup-источники (`/proc/wakeup_sources` недоступен на этом ядре;
    брать из dmesg-строк `active wakeup source:`).
