@@ -680,14 +680,17 @@ def ui_dump():
 
 
 def find_center(xml, texts):
-    """Центр первого <node>, чей text (без учёта регистра) совпал. Или None."""
+    """Центр первого <node>, чей text (без учёта регистра) совпал. Или None.
+    Сравнение: точное либо начало строки — чтобы ловить тайл хоста
+    «archpizdetc - Offline» по маске SERVER_NAME (2026-10-28)."""
     for node in re.split(r"<node", xml):
         m = re.search(r'text="([^"]*)"', node)
         b = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
         if not m or not b:
             continue
         val = m.group(1).strip().lower()
-        if val and any(val == t.lower() for t in texts):
+        if val and any(val == t.lower() or val.startswith(t.lower() + " ")
+                       for t in texts):
             x1, y1, x2, y2 = map(int, b.groups())
             return (x1 + x2) // 2, (y1 + y2) // 2
     return None
@@ -719,10 +722,15 @@ def tablet_awake():
     return "mWakefulness=Awake" in out
 
 
-def reconnect_stream(max_tries=12):
+def reconnect_stream(max_tries=6):
     """Ведём UI Limelight к живому стриму. Best-effort: тапаем только по
-    уверенно найденным узлам. После пере-enumeration USB-Preferences могут
-    перехватить фокус — закрываем BACK и возвращаем Limelight."""
+    уверенно найденным узлам. После ТАПА ПО ХОСТУ/DESKTOP клиент уходит в
+    рукопожатие (RTSP -> ANNOUNCE -> probe_output_size -> spawn ffmpeg);
+    этот цикл может занять десятки секунд, и monkey-relaunch на этом этапе
+    РВЁТ соединение (инцидент 2026-10-28: лог nx-server — ANNOUNCE в
+    13:29:08, клиент обратно в списке через 6 с после launch_limelight).
+    Поэтому после тапа ждём старта до ~45 с и Limelight не трогаем;
+    незнакомое состояние тоже не трогаем (ждём), а не relaunch'им."""
     global _last_reconnect
     now = time.time()
     if not tablet_awake():
@@ -735,6 +743,8 @@ def reconnect_stream(max_tries=12):
     _last_reconnect = now
     launch_limelight()
     time.sleep(3)
+    refreshed = False
+    offline_hits = 0
     for _ in range(max_tries):
         if stream_active():
             return True
@@ -750,6 +760,41 @@ def reconnect_stream(max_tries=12):
             launch_limelight()
             time.sleep(3)
             continue
+        # Контекст-меню/алерт хоста («<host> - Offline» + Delete PC / View
+        # Details / Test Network Connection): Moonlight кэшировал «offline»
+        # и по тайлу стрим не запускает. Закрываем BACK, список перечитаем
+        # pull-to-refresh ниже (2026-10-28).
+        if ("delete pc" in low or "view details" in low
+                or "wake-on-lan" in low or "test network connection" in low):
+            offline_hits += 1
+            if offline_hits >= 2:
+                # Кэш «offline» не сбрасывается ни BACK, ни pull-to-refresh:
+                # Moonlight перестал опрашивать сервер после обрыва (2026-10-28,
+                # в логе nx-server ни одного serverinfo от клиента). Полный
+                # рестарт Limelight читает список заново. Стрима нет — табу
+                # допускает force-stop com.limelight.
+                log("  стрим: кэш «host offline» держится — рестартую Limelight")
+                adb("am force-stop com.limelight")
+                time.sleep(2)
+                launch_limelight()
+                offline_hits = 0
+                refreshed = False
+                time.sleep(4)
+                continue
+            log("  стрим: закрываю алерт «host offline» (BACK)")
+            adb("input keyevent KEYCODE_BACK")
+            refreshed = False
+            time.sleep(2)
+            continue
+        # Список хостов виден: первый раз за раунд — принудительный
+        # pull-to-refresh, чтобы Moonlight перезапросил статус хоста
+        # (сервер отвечает, но кэш «offline» не сбрасывается сам).
+        if find_center(xml, [SERVER_NAME]) and not refreshed:
+            log("  стрим: обновляю список хостов (pull-to-refresh)")
+            adb("input swipe 1024 500 1024 1200 400")
+            refreshed = True
+            time.sleep(8)
+            continue
         # Диалог Connection Error у Moonlight после обрыва: заголовок
         # «Connection Error», тело «Failed to start Desktop … 47984 47989»
         # (2026-10-24). Ни "terminat", ни "disconnect" тут не встречаются,
@@ -762,17 +807,23 @@ def reconnect_stream(max_tries=12):
                   or (1457, 896))
             log("  стрим: тапаю OK диалога обрыва")
             tap(pt)
-        elif find_center(xml, ["Desktop"]):
-            log("  стрим: тапаю Desktop")
-            tap(find_center(xml, ["Desktop"]))
-        elif find_center(xml, [SERVER_NAME]):
-            log("  стрим: тапаю хост %s" % SERVER_NAME)
-            tap(find_center(xml, [SERVER_NAME]))
-        else:
-            # незнакуемое состояние — не тапаем вслепую, пробуем вернуть Limelight
-            log("  стрим: неизвестное состояние UI, возвращаю Limelight")
-            launch_limelight()
-        time.sleep(4)
+            time.sleep(4)
+            continue
+        launch_pt = (find_center(xml, ["Desktop"])
+                     or find_center(xml, [SERVER_NAME]))
+        if launch_pt:
+            log("  стрим: тапаю хост/Desktop %s" % (launch_pt,))
+            tap(launch_pt)
+            # Ждём рукопожатие: НЕ relaunch'им, иначе рвём соединение.
+            for _w in range(15):
+                if stream_active():
+                    return True
+                time.sleep(3)
+            continue
+        # незнакомое состояние — не тапаем вслепую и не relaunch'им
+        # (может убить начавшийся handshake), просто ждём.
+        log("  стрим: неизвестное состояние UI — жду")
+        time.sleep(6)
     return stream_active()
 
 
